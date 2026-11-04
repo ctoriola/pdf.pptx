@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PDF to Slides</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+<main class="wrap">
+  <header>
+    <h1>PDF to Slides</h1>
+    <p class="lede">Upload a PDF and get a ready-to-present PowerPoint deck. Text, tables and images are pulled from the document and laid out to fit each slide.</p>
+  </header>
+
+  <form id="form" class="card" enctype="multipart/form-data">
+    <label class="drop" id="drop">
+      <input type="file" name="pdf" id="pdf" accept="application/pdf,.pdf" required>
+      <span class="drop-title" id="drop-title">Choose a PDF or drop it here</span>
+      <span class="hint">Up to {{ max_upload_mb }} MB</span>
+    </label>
+
+    <fieldset>
+      <legend>Slide type</legend>
+      <div class="modes">
+        {% for key, plan in plans.items() %}
+        {% set disabled = plan.uses_llm and not llm_ready %}
+        <label class="mode{% if disabled %} disabled{% endif %}">
+          <input type="radio" name="mode" value="{{ key }}" {% if key == default_mode %}checked{% endif %} {% if disabled %}disabled{% endif %}>
+          <span class="mode-body">
+            <span class="mode-title">{{ plan.label }}{% if plan.uses_llm %} <span class="tag">AI</span>{% endif %}</span>
+            <span class="mode-desc">{{ plan.description }}</span>
+            {% if disabled %}<span class="mode-desc warn">Needs an AI key on the server (GROQ_API_KEY).</span>{% endif %}
+          </span>
+        </label>
+        {% endfor %}
+      </div>
+    </fieldset>
+
+    <div class="row">
+      <label class="field">
+        <span>Theme</span>
+        <select name="theme">
+          {% for key, theme in themes.items() %}
+          <option value="{{ key }}" {% if key == default_theme %}selected{% endif %}>{{ theme.name }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="field grow">
+        <span>Deck title <em>(optional)</em></span>
+        <input type="text" name="title" maxlength="120" placeholder="Uses the PDF's title if left blank">
+      </label>
+    </div>
+
+    <button type="submit" id="submit">Convert to slides</button>
+  </form>
+
+  <section id="progress" class="card" hidden>
+    <div class="spinner" id="spinner"></div>
+    <p id="message">Uploading…</p>
+    <div id="result" hidden>
+      <p class="done-title" id="done-title"></p>
+      <div class="actions">
+        <a id="dl-pptx" class="button">Download .pptx</a>
+        <a id="dl-md" class="button secondary">Download Markdown + images</a>
+      </div>
+    </div>
+    <button type="button" id="again" class="link" hidden>Convert another PDF</button>
+  </section>
+</main>
+
+<script>
+(() => {
+  const form = document.getElementById('form');
+  const input = document.getElementById('pdf');
+  const drop = document.getElementById('drop');
+  const dropTitle = document.getElementById('drop-title');
+  const progress = document.getElementById('progress');
+  const message = document.getElementById('message');
+  const spinner = document.getElementById('spinner');
+  const result = document.getElementById('result');
+  const again = document.getElementById('again');
+
+  input.addEventListener('change', () => {
+    dropTitle.textContent = input.files[0] ? input.files[0].name : 'Choose a PDF or drop it here';
+  });
+  ['dragover', 'dragenter'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add('over'); }));
+  ['dragleave', 'drop'].forEach(e => drop.addEventListener(e, () => drop.classList.remove('over')));
+  drop.addEventListener('drop', ev => {
+    ev.preventDefault();
+    if (ev.dataTransfer.files.length) { input.files = ev.dataTransfer.files; input.dispatchEvent(new Event('change')); }
+  });
+
+  function show(state, text) {
+    progress.hidden = false;
+    message.textContent = text;
+    message.className = state === 'error' ? 'error' : '';
+    spinner.hidden = state !== 'running';
+    again.hidden = state === 'running';
+  }
+
+  async function poll(jobId) {
+    try {
+      const res = await fetch(`/status/${jobId}`);
+      const data = await res.json();
+      if (data.state === 'running') {
+        show('running', data.message);
+        return setTimeout(() => poll(jobId), 1500);
+      }
+      if (data.state === 'done') {
+        show('done', data.message);
+        document.getElementById('done-title').textContent = `${data.title} · ${data.slides} slides`;
+        document.getElementById('dl-pptx').href = `/download/${jobId}/pptx`;
+        document.getElementById('dl-md').href = `/download/${jobId}/markdown`;
+        result.hidden = false;
+        return;
+      }
+      show('error', data.message || 'The conversion failed.');
+    } catch (err) {
+      setTimeout(() => poll(jobId), 3000);
+    }
+  }
+
+  form.addEventListener('submit', async ev => {
+    ev.preventDefault();
+    form.hidden = true;
+    result.hidden = true;
+    show('running', 'Uploading…');
+    try {
+      const res = await fetch('/convert', { method: 'POST', body: new FormData(form) });
+      const data = await res.json();
+      if (!res.ok) return show('error', data.error || 'Upload failed.');
+      poll(data.job_id);
+    } catch (err) {
+      show('error', 'Could not reach the server.');
+    }
+  });
+
+  again.addEventListener('click', () => {
+    progress.hidden = true;
+    form.hidden = false;
+  });
+})();
+</script>
+</body>
+</html>

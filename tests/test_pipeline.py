@@ -1,0 +1,199 @@
+"""
+Tests for everything after Docling: Markdown parsing, image filtering, section handling,
+LLM plumbing (with the HTTP call stubbed out) and deck building for every slide type.
+"""
+import json
+import shutil
+from pathlib import Path
+
+import pytest
+from PIL import Image
+from pptx import Presentation
+from pptx.util import Emu
+
+import condense
+import pdf_to_md
+from deck_builder import SLIDE_H, SLIDE_W, THEMES
+from md_parse import parse_blocks, parse_markdown
+from pipeline import build_from_markdown, load_sections, merge_empty_sections
+
+FIXTURES = Path(__file__).parent / 'fixtures'
+SAMPLE = FIXTURES / 'sample.md'
+
+
+def pictures(prs):
+    return [sh for slide in prs.slides for sh in slide.shapes if sh.shape_type == 13]
+
+
+def open_deck(buffer):
+    return Presentation(buffer)
+
+
+def assert_on_slide(prs):
+    for n, slide in enumerate(prs.slides, 1):
+        for sh in slide.shapes:
+            if sh.shape_type == 13:  # pictures must stay inside the slide
+                assert sh.left >= 0 and sh.top >= 0, f'slide {n}'
+                assert Emu(sh.left + sh.width).inches <= SLIDE_W + 0.01, f'slide {n}'
+                assert Emu(sh.top + sh.height).inches <= SLIDE_H + 0.01, f'slide {n}'
+
+
+# ---------- parsing ----------
+def test_parse_sections_images_and_captions():
+    title, sections = parse_markdown(SAMPLE.read_text())
+    assert title == 'Renewable Energy Outlook for West Africa 2026'
+    names = [n for n, _ in sections]
+    assert names[0] == 'Overview' and 'Key Figures' in names
+    summary = dict(sections)['Executive Summary']
+    image = next(b for b in summary if b['type'] == 'image')
+    assert image['path'] == 'images/chart_wide.png'
+    assert image['caption'].startswith('Figure 1')
+    assert not any(b['type'] == 'para' and b['text'].startswith('Figure 1') for b in summary)
+
+
+def test_parse_undoes_docling_escaping_and_placeholders():
+    _, sections = parse_markdown('## S\n\nsnake\\_case &amp; more\n\n<!-- image -->\n\n- item one\n  wrapped')
+    blocks = sections[0][1]
+    assert blocks[0] == {'type': 'para', 'text': 'snake_case & more'}
+    assert len(blocks) == 2
+    lst = next(b for b in blocks if b['type'] == 'list')
+    assert lst['items'] == ['item one wrapped']
+
+
+def test_merge_empty_sections():
+    merged = merge_empty_sections([('3 Methods', []), ('3.1 Data', [{'type': 'para', 'text': 'x'}])])
+    assert merged == [('3 Methods', [{'type': 'sub', 'text': '3.1 Data'}, {'type': 'para', 'text': 'x'}])]
+
+
+def test_load_sections_rejects_paths_outside_job_folder(tmp_path):
+    md = tmp_path / 'doc.md'
+    md.write_text('## A\n\nText here.\n\n![Image](../../etc/passwd)\n\n![Image](missing.png)\n')
+    _, sections = load_sections(md)
+    assert all(b['type'] != 'image' for _, blocks in sections for b in blocks)
+
+
+# ---------- image filtering ----------
+def test_filter_images_drops_icons_blanks_and_repeated_logos(tmp_path):
+    img = tmp_path / 'images'
+    img.mkdir()
+    for name in ('chart_wide.png', 'icon.png', 'blank.png'):
+        shutil.copy(FIXTURES / 'images' / name, img / name)
+    Image.new('RGB', (2000, 100), 'black').save(img / 'rule.png')
+    logo = Image.new('RGB', (300, 300), 'white')
+    logo.paste((200, 0, 0), (50, 50, 250, 250))
+    logo.save(img / 'logo.png')
+    md = '\n\n'.join(['![Image](images/chart_wide.png)', '![Image](images/icon.png)', '![Image](images/blank.png)',
+                      '![Image](images/rule.png)'] + ['![Image](images/logo.png)'] * 3)
+    kept = pdf_to_md.filter_images(md, tmp_path)
+    assert kept.strip() == '![Image](images/chart_wide.png)'
+
+
+def test_filter_images_keeps_first_of_a_duplicate_pair(tmp_path):
+    (tmp_path / 'images').mkdir()
+    shutil.copy(FIXTURES / 'images' / 'photo2.png', tmp_path / 'images' / 'a.png')
+    shutil.copy(FIXTURES / 'images' / 'photo2.png', tmp_path / 'images' / 'b.png')
+    kept = pdf_to_md.filter_images('![Image](images/a.png)\n\n![Image](images/b.png)', tmp_path)
+    assert 'a.png' in kept and 'b.png' not in kept
+
+
+def test_clean_markdown_removes_page_numbers_keeps_years():
+    out = pdf_to_md.clean_markdown('Intro text\n\n12\n\nPage 3 of 10\n\n2024\n')
+    assert '12' not in out.split() and 'Page' not in out and '2024' in out
+
+
+# ---------- Standard (no LLM) ----------
+@pytest.mark.parametrize('theme', list(THEMES))
+def test_standard_deck_every_theme(theme):
+    buffer, title, slides = build_from_markdown(SAMPLE, 'standard', theme)
+    prs = open_deck(buffer)
+    assert len(prs.slides) == slides
+    # cover + agenda + 8 sections (+ figures/continuations) + closing
+    assert slides >= 11
+    # 1 image beside the summary text, 3 in the gallery: each extracted image appears exactly once
+    assert len(pictures(prs)) == 4
+    assert_on_slide(prs)
+
+
+def test_standard_deck_keeps_all_text():
+    buffer, _, _ = build_from_markdown(SAMPLE, 'standard')
+    prs = open_deck(buffer)
+    text = ' '.join(sh.text_frame.text for s in prs.slides for sh in s.shapes if sh.has_text_frame)
+    assert 'without affordable credit' in text  # end of the long section, on its continuation slide
+    assert '(cont.)' in text
+
+
+# ---------- LLM modes (HTTP stubbed) ----------
+class FakeLLM:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, system, user, max_tokens=1500, retries=5):
+        self.calls.append(user)
+        if '"notes"' in user:
+            return {'notes': 'Dense notes.'}
+        if 'Summarise' in user:
+            return {'title': 'Summary slide', 'body': 'One framing sentence.\n\n- **Point** one\n- Point two\n- Point three'}
+        return {'title': 'Expanded', 'body': 'A longer explanation of the section.\n\n### Key takeaways\n\n- First\n- Second'}
+
+
+def test_condensed_groups_sections_and_keeps_images(monkeypatch):
+    fake = FakeLLM()
+    monkeypatch.setattr(condense, 'chat_json', fake)
+    monkeypatch.setitem(condense.__dict__, 'CONDENSED_MAX_IMAGES', 2)
+    from slide_plan import PLANS
+    monkeypatch.setitem(PLANS['condensed'], 'max_sections', 4)
+    buffer, _, slides = build_from_markdown(SAMPLE, 'condensed')
+    prs = open_deck(buffer)
+    assert len(fake.calls) == 4  # one request per slide group
+    assert not any('images/' in c for c in fake.calls)  # image files never go to the LLM
+    assert any('[Figure: Figure 2' in c for c in fake.calls)  # but their captions do, as context
+    assert 1 <= len(pictures(prs)) <= 4 * 2
+    assert_on_slide(prs)
+
+
+def test_detailed_reattaches_tables_and_images(monkeypatch):
+    fake = FakeLLM()
+    monkeypatch.setattr(condense, 'chat_json', fake)
+    buffer, _, _ = build_from_markdown(SAMPLE, 'detailed')
+    prs = open_deck(buffer)
+    tables = [sh for s in prs.slides for sh in s.shapes if sh.has_table]
+    assert len(tables) == 1 and tables[0].table.cell(1, 0).text == 'Nigeria'
+    assert len(pictures(prs)) == 4
+    assert any('| Nigeria |' in c for c in fake.calls)  # the LLM saw the table to explain it
+
+
+def test_long_sections_are_noted_before_rewriting(monkeypatch):
+    fake = FakeLLM()
+    monkeypatch.setattr(condense, 'chat_json', fake)
+    blocks = [{'type': 'para', 'text': 'word ' * 3000}]
+    condense.expand_sections('Doc', [('Long', blocks)], {'words': 200})
+    assert sum('"notes"' in c for c in fake.calls) == 2 and len(fake.calls) == 3
+
+
+def test_group_sections_merges_smallest_neighbours():
+    p = lambda n: [{'type': 'para', 'text': 'w ' * n}]
+    groups = condense.group_sections([('a', p(500)), ('b', p(10)), ('c', p(10)), ('d', p(500))], 3)
+    assert [[n for n, _ in g] for g in groups] == [['a'], ['b', 'c'], ['d']]
+
+
+def test_chat_json_retries_on_rate_limit(monkeypatch):
+    class Resp:
+        def __init__(self, code, body=None):
+            self.status_code, self._body, self.headers, self.text = code, body, {'retry-after': '0'}, ''
+
+        def json(self):
+            return self._body
+
+    replies = [Resp(429), Resp(200, {'choices': [{'message': {'content': json.dumps({'title': 'ok'})}}]})]
+    monkeypatch.setattr(condense.requests, 'post', lambda *a, **k: replies.pop(0))
+    monkeypatch.setattr(condense.time, 'sleep', lambda s: None)
+    monkeypatch.setenv('GROQ_API_KEY', 'test')
+    assert condense.chat_json('s', 'u') == {'title': 'ok'}
+
+
+def test_chat_json_reports_rejected_key(monkeypatch):
+    class Resp:
+        status_code, headers, text = 401, {}, 'invalid api key'
+    monkeypatch.setattr(condense.requests, 'post', lambda *a, **k: Resp())
+    with pytest.raises(condense.LLMError, match='401'):
+        condense.chat_json('s', 'u')
