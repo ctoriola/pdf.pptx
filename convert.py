@@ -2,7 +2,7 @@
 Command-line converter.
 
     python convert.py report.pdf --mode condensed --theme green -o report.pptx
-    python convert.py notes.md --mode standard          # skip Docling, start from Markdown
+    python convert.py notes.md --mode standard          # skip PDF parsing, start from Markdown
 """
 import argparse
 import logging

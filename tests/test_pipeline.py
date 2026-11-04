@@ -197,3 +197,111 @@ def test_chat_json_reports_rejected_key(monkeypatch):
     monkeypatch.setattr(condense.requests, 'post', lambda *a, **k: Resp())
     with pytest.raises(condense.LLMError, match='401'):
         condense.chat_json('s', 'u')
+
+
+# ---------- PDF -> Markdown (real PyMuPDF run on tests/fixtures/sample.pdf) ----------
+SAMPLE_PDF = FIXTURES / 'sample.pdf'
+
+
+def test_normalize_headings_title_and_levels():
+    md = '# **Report Title**\n\nIntro.\n\n# **Summary**\n\nText.\n\n## **Detail**\n\nMore.'
+    out = pdf_to_md.normalize_headings(md)
+    assert out.split('\n')[0] == '# Report Title'
+    assert '## Summary' in out and '### Detail' in out
+
+
+def test_normalize_headings_uses_metadata_title_when_doc_has_none():
+    out = pdf_to_md.normalize_headings('Some intro text.\n\n## Part one\n\nBody.', 'Annual Review')
+    assert out.startswith('# Annual Review') and '## Part one' in out
+    assert not pdf_to_md.normalize_headings('Text.\n\n## A\n\nB', 'Microsoft Word - draft.docx').startswith('#')
+
+
+def test_italic_caption_is_attached():
+    blocks = parse_blocks('![](images/a.png)\n\n_Figure 4: Results._')
+    assert blocks == [{'type': 'image', 'path': 'images/a.png', 'caption': 'Figure 4: Results.'}]
+
+
+def test_convert_pdf_end_to_end(tmp_path):
+    md_path = pdf_to_md.convert_pdf(SAMPLE_PDF, tmp_path)
+    text = md_path.read_text()
+    assert 'Confidential draft' not in text and 'Page 1' not in text  # running header/footer removed
+    title, sections = load_sections(md_path)
+    assert title == 'Renewable Energy Outlook for West Africa 2026'
+    names = [n for n, _ in sections]
+    assert 'Executive Summary' in names and 'Market Size by Country' in names
+    method = dict(sections)['Methodology']  # bold-only heading recovered (as a sub-heading)
+    assert {'type': 'sub', 'text': 'Regional Gallery'} in method
+    images = {n: [b for b in bl if b['type'] == 'image'] for n, bl in sections}
+    assert len(images['Executive Summary']) == 1  # the figure stays in its own section
+    assert images['Executive Summary'][0]['caption'].startswith('Figure 1')
+    assert sum(len(v) for v in images.values()) == 3
+    assert any(b['type'] == 'table' for b in dict(sections)['Market Size by Country'])
+    assert all(Path(b['path']).is_file() for v in images.values() for b in v)
+
+
+def test_convert_rejects_text_free_pdf(tmp_path):
+    import pymupdf
+    doc = pymupdf.open()
+    doc.new_page()
+    doc.save(tmp_path / 'blank.pdf')
+    with pytest.raises(pdf_to_md.PdfConversionError, match='scanned'):
+        pdf_to_md.convert_pdf(tmp_path / 'blank.pdf', tmp_path / 'out')
+
+
+# ---------- size control ----------
+def test_shrink_pptx_recompresses_pictures(tmp_path):
+    from io import BytesIO
+    import random
+    from deck_builder import build_deck, shrink_pptx
+    random.seed(0)
+    noisy = Image.effect_noise((1600, 1200), 80).convert('RGB')
+    noisy.save(tmp_path / 'p.jpg', quality=95)
+    sections = [('Photo', [{'type': 'image', 'path': str(tmp_path / 'p.jpg'), 'caption': ''}])]
+    buffer, _ = build_deck('T', sections)
+    size = buffer.getbuffer().nbytes
+    small = shrink_pptx(buffer, size // 3)
+    assert small.getbuffer().nbytes <= size // 3
+    assert len(pictures(Presentation(small))) == 1
+
+
+# ---------- web app ----------
+@pytest.fixture
+def client(monkeypatch):
+    monkeypatch.delenv('GROQ_API_KEY', raising=False)
+    monkeypatch.delenv('LLM_API_KEY', raising=False)
+    import app as webapp
+    return webapp.app.test_client()
+
+
+def test_app_converts_pdf(client):
+    with open(SAMPLE_PDF, 'rb') as f:
+        res = client.post('/convert', data={'pdf': (f, 'sample.pdf'), 'mode': 'standard', 'theme': 'green'})
+    assert res.status_code == 200, res.data[:300]
+    assert res.mimetype.endswith('presentationml.presentation')
+    prs = Presentation(__import__('io').BytesIO(res.data))
+    assert len(prs.slides) == int(res.headers['X-Slide-Count'])
+    assert len(pictures(prs)) == 3
+
+
+def test_app_markdown_zip(client):
+    import io
+    import zipfile
+    with open(SAMPLE_PDF, 'rb') as f:
+        res = client.post('/markdown', data={'pdf': (f, 'sample.pdf')})
+    assert res.status_code == 200
+    names = zipfile.ZipFile(io.BytesIO(res.data)).namelist()
+    assert 'document.md' in names and sum(n.startswith('images/') for n in names) == 3
+
+
+def test_app_rejects_bad_input(client):
+    import io
+    assert client.post('/convert', data={'pdf': (io.BytesIO(b'hello'), 'x.pdf')}).status_code == 400
+    with open(SAMPLE_PDF, 'rb') as f:
+        res = client.post('/convert', data={'pdf': (f, 'sample.pdf'), 'mode': 'condensed'})
+    assert res.status_code == 400 and 'AI key' in res.json['error']
+
+
+def test_bold_lines_become_headings():
+    out = pdf_to_md.clean_markdown('We combined data. **Regional Gallery**\n\nText.\n\n**Bold sentence.**\n')
+    assert '### Regional Gallery' in out and 'We combined data.\n' in out
+    assert '**Bold sentence.**' in out  # ends like a sentence, so it stays body text

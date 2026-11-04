@@ -9,6 +9,7 @@ while one-slide-per-section decks (Condensed) shrink the text instead.
 import math
 import re
 import threading
+import zipfile
 from datetime import date
 from io import BytesIO
 
@@ -692,6 +693,52 @@ def section_notes(name, blocks):
         elif b['type'] == 'image' and b.get('caption'):
             lines.append(f'[Figure: {b["caption"]}]')
     return '\n'.join(lines)
+
+
+# ============================================================
+# Size control
+# ============================================================
+SHRINK_STEPS = ((1400, 80), (1100, 70), (850, 60), (650, 50))
+
+
+def shrink_pptx(buffer, target_bytes):
+    """
+    Recompress the pictures inside a finished .pptx until it is under target_bytes.
+    Files keep their names and formats, so no slide XML needs to change.
+    """
+    data = buffer.getvalue()
+    if len(data) <= target_bytes:
+        return BytesIO(data)
+    for max_px, quality in SHRINK_STEPS:
+        out = BytesIO()
+        with zipfile.ZipFile(BytesIO(data)) as src, zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as dst:
+            for item in src.infolist():
+                content = src.read(item.filename)
+                if item.filename.startswith('ppt/media/'):
+                    content = _recompress(content, max_px, quality)
+                dst.writestr(item, content)
+        if out.getbuffer().nbytes <= target_bytes:
+            break
+    out.seek(0)
+    return out
+
+
+def _recompress(content, max_px, quality):
+    try:
+        with Image.open(BytesIO(content)) as im:
+            fmt = im.format
+            img = im.copy()
+    except (OSError, ValueError):
+        return content
+    if fmt not in ('JPEG', 'PNG'):
+        return content
+    img.thumbnail((max_px, max_px), Image.LANCZOS)
+    buf = BytesIO()
+    if fmt == 'JPEG':
+        img.convert('RGB').save(buf, 'JPEG', quality=quality, optimize=True)
+    else:
+        img.save(buf, 'PNG', optimize=True)
+    return buf.getvalue() if buf.tell() < len(content) else content
 
 
 # ============================================================

@@ -19,7 +19,7 @@ CAPTION_RE = re.compile(r'^(fig(ure)?\.?|image|chart|photo|diagram|graph|exhibit
 def parse_markdown(markdown):
     """Return (document_title, [(section_title, [blocks])])."""
     text = html.unescape((markdown or '').replace('\r', ''))
-    text = re.sub(r'<!--.*?-->', '', text, flags=re.S)  # docling image placeholders, comments
+    text = re.sub(r'<!--.*?-->', '', text, flags=re.S)  # image placeholders, HTML comments
     title = None
     m = re.search(r'^#\s+(.+?)\s*#*\s*$', text, re.M)
     if m:
@@ -98,39 +98,48 @@ def parse_blocks(body):
     return attach_captions(blocks)
 
 
+def _caption(block):
+    """The caption text if this paragraph looks like 'Figure 3: ...' (italics allowed), else None."""
+    if block['type'] != 'para':
+        return None
+    text = plain(block['text']).strip('_* ')
+    return text if CAPTION_RE.match(text) and len(text) <= 300 else None
+
+
 def attach_captions(blocks):
     """Move a 'Figure 3: ...' paragraph next to an image into that image's caption."""
     out = []
     for b in blocks:
         prev = out[-1] if out else None
-        if (b['type'] == 'para' and prev and prev['type'] == 'image' and not prev['caption']
-                and CAPTION_RE.match(b['text']) and len(b['text']) <= 300):
-            prev['caption'] = b['text']
+        if prev and prev['type'] == 'image' and not prev['caption'] and _caption(b):
+            prev['caption'] = _caption(b)
             continue
-        if (b['type'] == 'image' and not b['caption'] and prev and prev['type'] == 'para'
-                and CAPTION_RE.match(prev['text']) and len(prev['text']) <= 300):
-            b = {**b, 'caption': out.pop()['text']}
+        if b['type'] == 'image' and not b['caption'] and prev and _caption(prev):
+            b = {**b, 'caption': _caption(out.pop())}
         out.append(b)
     return out
 
 
 def clean_inline(text):
-    """Undo Markdown escaping that docling adds (\\_ \\* \\#) and collapse whitespace."""
+    """Undo Markdown escaping that PDF converters add (\\_ \\* \\#) and collapse whitespace."""
     text = re.sub(r'\\([_*#\[\]()|`>~-])', r'\1', text or '')
     return re.sub(r'\s+', ' ', text).strip()
 
 
 def plain(text):
-    return re.sub(r'\*\*(.+?)\*\*|\*(.+?)\*|__(.+?)__', lambda m: next(g for g in m.groups() if g), text or '')
+    return re.sub(r'\*\*(.+?)\*\*|\*(.+?)\*|__(.+?)__|(?<!\w)_(?!\s)(.+?)_(?!\w)',
+                  lambda m: next(g for g in m.groups() if g), text or '')
 
 
 def inline_runs(text):
     """Split Markdown inline text into [(text, bold, italic)]."""
     runs, pos = [], 0
-    for m in re.finditer(r'\*\*(.+?)\*\*|__(.+?)__|(?<![*\w])\*(?!\s)(.+?)\*(?![*\w])', text or ''):
+    pattern = r'\*\*(.+?)\*\*|__(.+?)__|(?<![*\w])\*(?!\s)(.+?)\*(?![*\w])|(?<![_\w])_(?!\s)(.+?)_(?![_\w])'
+    for m in re.finditer(pattern, text or ''):
         if m.start() > pos:
             runs.append((text[pos:m.start()], False, False))
-        runs.append((m.group(1) or m.group(2) or m.group(3), bool(m.group(1) or m.group(2)), bool(m.group(3))))
+        italic = m.group(3) or m.group(4)
+        runs.append((m.group(1) or m.group(2) or italic, bool(m.group(1) or m.group(2)), bool(italic)))
         pos = m.end()
     if pos < len(text or ''):
         runs.append((text[pos:], False, False))
