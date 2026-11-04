@@ -518,10 +518,21 @@ def test_check_app_key_reports_write_failure(monkeypatch):
     import b2_admin
 
     class R:
-        def __init__(self, code):
-            self.status_code = code
-    monkeypatch.setattr(b2_admin.requests, 'put', lambda *a, **k: R(403))
-    assert 'could not write' in b2_admin.check_app_key()
+        def __init__(self, code, text=''):
+            self.status_code, self.text = code, text
+    body = '<Error><Code>SignatureDoesNotMatch</Code><Message>Signature validation failed</Message></Error>'
+    monkeypatch.setattr(b2_admin.requests, 'put', lambda *a, **k: R(403, body))
+    msg = b2_admin.check_app_key()
+    assert 'could not write' in msg and 'does not belong to B2_KEY_ID' in msg and 'Signature validation failed' in msg
+    assert 'region us-east-005' in msg and B2_ENV['B2_APPLICATION_KEY'] not in msg
     monkeypatch.setattr(b2_admin.requests, 'put', lambda *a, **k: R(200))
     monkeypatch.setattr(b2_admin.requests, 'delete', lambda *a, **k: R(204))
     assert b2_admin.check_app_key() is None
+
+
+def test_config_strips_pasted_whitespace_and_quotes(monkeypatch):
+    for k, v in B2_ENV.items():
+        monkeypatch.setenv(k, f' "{v}"\n')
+    cfg = storage._config()
+    assert cfg['key_id'] == B2_ENV['B2_KEY_ID'] and cfg['secret'] == B2_ENV['B2_APPLICATION_KEY']
+    assert cfg['host'] == B2_ENV['B2_ENDPOINT'] and cfg['region'] == 'us-east-005'

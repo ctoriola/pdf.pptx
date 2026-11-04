@@ -45,12 +45,25 @@ def enabled():
     return all(os.environ.get(k) for k in ('B2_KEY_ID', 'B2_APPLICATION_KEY', 'B2_BUCKET', 'B2_ENDPOINT'))
 
 
+def _env(name):
+    # Pasted values often carry spaces, line breaks or quotes, which break the signature
+    return os.environ.get(name, '').strip().strip('"\'').strip()
+
+
 def _config():
-    endpoint = re.sub(r'^https?://', '', os.environ['B2_ENDPOINT'].strip()).rstrip('/')
+    endpoint = re.sub(r'^https?://', '', _env('B2_ENDPOINT')).rstrip('/')
     m = re.match(r'^s3\.([a-z0-9-]+)\.backblazeb2\.com$', endpoint)
-    region = os.environ.get('B2_REGION') or (m.group(1) if m else 'us-east-1')
-    return {'host': endpoint, 'region': region, 'bucket': os.environ['B2_BUCKET'],
-            'key_id': os.environ['B2_KEY_ID'], 'secret': os.environ['B2_APPLICATION_KEY']}
+    region = _env('B2_REGION') or (m.group(1) if m else 'us-east-1')
+    return {'host': endpoint, 'region': region, 'bucket': _env('B2_BUCKET'),
+            'key_id': _env('B2_KEY_ID'), 'secret': _env('B2_APPLICATION_KEY')}
+
+
+def s3_error(resp):
+    """(code, message) from an S3-style XML error body."""
+    body = getattr(resp, 'text', '') or ''
+    code = re.search(r'<Code>(.*?)</Code>', body, re.S)
+    message = re.search(r'<Message>(.*?)</Message>', body, re.S)
+    return (code.group(1).strip() if code else ''), (message.group(1).strip() if message else body[:200].strip())
 
 
 # ============================================================

@@ -88,6 +88,27 @@ def configure_bucket(key_id, key, bucket_name, origins=None):
     return {'bucket': bucket_name, 'origins': allowed}
 
 
+APP_KEY_HINTS = {
+    'InvalidAccessKeyId': 'B2_KEY_ID is not a valid key ID. Copy the app key\'s keyID again (not the master key).',
+    'SignatureDoesNotMatch': 'B2_APPLICATION_KEY does not belong to B2_KEY_ID. Re-copy it; it is shown only once, '
+                             'so if you no longer have it, create a new app key and update both settings.',
+    'AccessDenied': 'The key is not allowed to write to this bucket. Create an app key for bucket "{bucket}" with '
+                    'Read and Write access and update both settings.',
+    'AuthorizationHeaderMalformed': 'B2_ENDPOINT does not match the bucket\'s region. Copy the Endpoint from the '
+                                    'bucket\'s card again.',
+    'NoSuchBucket': 'B2_BUCKET does not match a bucket this key can see.',
+}
+
+
+def describe_failure(action, resp):
+    cfg = storage._config()
+    code, message = storage.s3_error(resp)
+    hint = APP_KEY_HINTS.get(code, 'Check B2_KEY_ID, B2_APPLICATION_KEY and B2_ENDPOINT.').format(bucket=cfg['bucket'])
+    detail = f'B2 said: {code or "HTTP " + str(resp.status_code)}' + (f' ({message})' if message else '')
+    return (f'The app key could not {action} (HTTP {resp.status_code}). {hint} {detail}. '
+            f'[key ID starts {cfg["key_id"][:6] or "(empty)"}, region {cfg["region"]}, bucket {cfg["bucket"]}]')
+
+
 def check_app_key():
     """Write and delete a small file with the app's own key. Returns None if fine, else a message."""
     path = 'uploads/setup-check.txt'
@@ -95,11 +116,10 @@ def check_app_key():
     try:
         put = requests.put(storage.presign('PUT', path, 300, headers), data=b'ok', headers=headers, timeout=30)
         if put.status_code >= 300:
-            return (f'The app key could not write to the bucket (HTTP {put.status_code}). Check B2_KEY_ID, '
-                    'B2_APPLICATION_KEY and B2_ENDPOINT, and that the key has Read and Write access.')
+            return describe_failure('write to the bucket', put)
         delete = requests.delete(storage.presign('DELETE', path, 300), timeout=30)
         if delete.status_code >= 300:
-            return f'The app key can write but not delete (HTTP {delete.status_code}). Give it Read and Write access.'
+            return describe_failure('delete files', delete)
     except requests.RequestException as exc:
         return f'Could not reach the bucket endpoint ({exc}). Check B2_ENDPOINT.'
     return None
