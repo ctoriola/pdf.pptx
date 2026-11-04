@@ -575,37 +575,52 @@ class DeckBuilder:
                      markdown=True, line_spacing=1.1)
 
     def _table_slide(self, number, name, blocks, notes):
-        table = next(b for b in blocks if b['type'] == 'table')
+        """
+        Table sections. Text sits beside the table only when both fit; otherwise the text
+        flows onto its own slides and each table follows at full width, split across
+        slides (header repeated) when it is too tall.
+        """
+        tables = [b for b in blocks if b['type'] == 'table']
         others = [b for b in blocks if b['type'] not in ('table', 'image')]
-        slide = self._new_slide(notes)
-        self._chrome(slide, number, name)
-        if others:
-            side_w = 4.3
-            size = fit_size(others, side_w, CONTENT_H) or MIN_BODY_PT
-            box = add_rich_text(slide, MARGIN, CONTENT_TOP + 0.05, side_w, CONTENT_H, others, size)
-            if not fit_size(others, side_w, CONTENT_H):
-                _shrink_on_overflow(box)
-            tx, tw = MARGIN + side_w + 0.5, CONTENT_W - side_w - 0.5
-        else:
-            tx, tw = MARGIN, CONTENT_W
-        rows = table['rows'][:14]
-        ncols = min(8, max(len(r) for r in rows))
-        row_h = min(0.6, CONTENT_H / len(rows))
-        shape = slide.shapes.add_table(len(rows), ncols, Inches(tx), Inches(CONTENT_TOP),
-                                       Inches(tw), Inches(row_h * len(rows)))
+        side_w = 4.3
+        table_w = CONTENT_W - side_w - 0.5
+        if len(tables) == 1 and others:
+            side_size = fit_size(others, side_w, CONTENT_H, READABLE_PT - 2)
+            fit = table_fit(tables[0]['rows'], table_w, CONTENT_H)
+            if side_size and fit:
+                slide = self._new_slide(notes)
+                self._chrome(slide, number, name)
+                add_rich_text(slide, MARGIN, CONTENT_TOP + 0.05, side_w, CONTENT_H, others, side_size)
+                self._draw_table(slide, MARGIN + side_w + 0.5, table_w, tables[0]['rows'], *fit)
+                return
+        first = True
+        if has_text(others):
+            self._text_slides(number, name, others, notes)
+            first = False
+        for table in tables:
+            for size, rows, heights in paginate_table(table['rows'], CONTENT_W, CONTENT_H):
+                slide = self._new_slide(notes)
+                self._chrome(slide, number, name if first else f'{name} (table)')
+                self._draw_table(slide, MARGIN, CONTENT_W, rows, size, heights)
+                first = False
+
+    def _draw_table(self, slide, x, width, rows, size, heights):
+        ncols = table_cols(rows)
+        shape = slide.shapes.add_table(len(rows), ncols, Inches(x), Inches(CONTENT_TOP),
+                                       Inches(width), Inches(sum(heights)))
         tbl = shape.table
         tblPr = tbl._tbl.tblPr
         tblPr.set('bandRow', '0')
         tblPr.set('firstRow', '1')
-        size = 16 if len(rows) <= 6 and ncols <= 4 else 13 if len(rows) <= 10 else 11
         for r, row in enumerate(rows):
-            tbl.rows[r].height = Inches(row_h)
+            tbl.rows[r].height = Inches(heights[r])
             for c in range(ncols):
                 cell = tbl.cell(r, c)
                 cell.fill.solid()
                 cell.fill.fore_color.rgb = T.accent if r == 0 else (T.bg if r % 2 else T.panel)
                 _cell_borders(cell, T.line)
-                cell.margin_left = cell.margin_right = Inches(0.12)
+                cell.margin_left = cell.margin_right = Inches(CELL_PAD_X)
+                cell.margin_top = cell.margin_bottom = Inches(CELL_PAD_Y)
                 cell.vertical_anchor = MSO_ANCHOR.MIDDLE
                 tf = cell.text_frame
                 tf.word_wrap = True
@@ -614,9 +629,60 @@ class DeckBuilder:
                     run = tf.paragraphs[0].add_run(); run.text = t
                     _style(run, size, T.on_accent if r == 0 else (T.ink if c == 0 or bold else T.body),
                            r == 0 or c == 0 or bold, italic)
-        if len(table['rows']) > len(rows):
-            add_text(slide, tx, CONTENT_BOTTOM - 0.05, tw, 0.3,
-                     f'+ {len(table["rows"]) - len(rows)} more rows in the source document', 10, T.muted, italic=True)
+
+
+# ============================================================
+# Table measurement
+# ============================================================
+TABLE_SIZES = (16, 14, 13, 12, 11, 10)
+MAX_TABLE_COLS = 8
+CELL_PAD_X, CELL_PAD_Y = 0.1, 0.05
+
+
+def table_cols(rows):
+    return min(MAX_TABLE_COLS, max(len(r) for r in rows))
+
+
+def table_row_heights(rows, width, size):
+    """Estimated height (inches) of each row at a font size, with equal column widths."""
+    ncols = table_cols(rows)
+    inner = width / ncols - 2 * CELL_PAD_X
+    per_line = max(4, int(inner / (size * CHAR_EM.get(T.body_font, 0.52) / 72)))
+    line_h = size * 1.2 / 72
+    heights = []
+    for row in rows:
+        lines = max([math.ceil(len(plain(c)) / per_line) for c in row[:ncols] if c] or [1])
+        heights.append(max(0.4, lines * line_h + 2 * CELL_PAD_Y + 0.08))
+    return heights
+
+
+def table_fit(rows, width, height, sizes=TABLE_SIZES):
+    """(size, row heights) for the largest font at which the whole table fits, else None."""
+    for size in sizes:
+        heights = table_row_heights(rows, width, size)
+        if sum(heights) <= height:
+            return size, heights
+    return None
+
+
+def paginate_table(rows, width, height):
+    """[(size, rows, heights)]: the whole table if it fits, else pages at 11pt with the header repeated."""
+    fit = table_fit(rows, width, height)
+    if fit:
+        return [(fit[0], rows, fit[1])]
+    size = 11
+    heights = table_row_heights(rows, width, size)
+    header, header_h = rows[0], heights[0]
+    pages, cur, cur_h = [], [], []
+    for row, h in zip(rows[1:], heights[1:]):
+        if cur and header_h + sum(cur_h) + h > height:
+            pages.append((size, [header] + cur, [header_h] + cur_h))
+            cur, cur_h = [], []
+        cur.append(row)
+        cur_h.append(h)
+    if cur or not pages:
+        pages.append((size, [header] + cur, [header_h] + cur_h))
+    return pages
 
 
 # ============================================================
@@ -631,7 +697,7 @@ def choose_layout(blocks):
     lists = [b for b in blocks if b['type'] == 'list']
     paras = [b for b in blocks if b['type'] == 'para']
     intro_chars = sum(len(plain(b['text'])) for b in paras)
-    if types.count('table') == 1:
+    if 'table' in types:
         return 'table'
     if 'sub' in types or len(lists) != 1:
         return 'text'

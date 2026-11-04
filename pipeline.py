@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 import condense
+import text_repair
 from deck_builder import build_deck
 from md_parse import parse_markdown, word_count
 from slide_plan import get_plan
@@ -67,6 +68,8 @@ def build_from_markdown(md_path, mode='standard', theme='coral', title=None, pdf
     progress = progress or (lambda msg: None)
     plan = get_plan(mode)
     md_title, sections = load_sections(md_path)
+    # Letter-spaced / run-together words from the PDF ("P R O D U C T", "BUILTFORASTRONGER")
+    md_title, sections = text_repair.repair_sections(md_title, sections, progress)
     title = deck_title(md_title, pdf_path, title)
     log.info('%s: %d sections, %d words', title, len(sections), sum(word_count(b) for _, b in sections))
 

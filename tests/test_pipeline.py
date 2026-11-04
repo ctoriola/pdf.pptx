@@ -536,3 +536,100 @@ def test_config_strips_pasted_whitespace_and_quotes(monkeypatch):
     cfg = storage._config()
     assert cfg['key_id'] == B2_ENV['B2_KEY_ID'] and cfg['secret'] == B2_ENV['B2_APPLICATION_KEY']
     assert cfg['host'] == B2_ENV['B2_ENDPOINT'] and cfg['region'] == 'us-east-005'
+
+
+# ---------- word-spacing repair (LLM stubbed) ----------
+import text_repair  # noqa: E402
+
+
+def test_needs_repair_detection():
+    assert text_repair.needs_repair('P R O D U C T C O D E')
+    assert text_repair.needs_repair('BUILTFORASTRONGERTOMORROW')
+    assert text_repair.needs_repair('O F F I C E A D D R E S S [Street, city, state]')
+    assert not text_repair.needs_repair('Multi-purpose Water resistant extreme duty')
+    assert not text_repair.needs_repair('DG-2')
+    assert not text_repair.needs_repair('See https://example.com/averyveryverylongpathsegmenthere')
+    assert not text_repair.needs_repair('Hours: 9 to 5 on weekdays, a b c')  # only 3 single letters
+
+
+def test_repair_keeps_only_space_changes(monkeypatch):
+    sent = []
+
+    def fake(system, user, max_tokens=1500, retries=5):
+        sent.append(user)
+        return {'fixed': ['PRODUCT CODE', 'BUILT FOR A STRONGER TOMORROW', 'DEFENSE INDUSTRIES']}
+    monkeypatch.setenv('GROQ_API_KEY', 'test')
+    monkeypatch.setattr(text_repair.condense, 'chat_json', fake)
+    fixes = text_repair.repair_strings(['P R O D U C T C O D E', 'BUILTFORASTRONGERTOMORROW', 'DEFENCEINDUSTRIES',
+                                        'normal text'])
+    assert fixes == {'P R O D U C T C O D E': 'PRODUCT CODE',
+                     'BUILTFORASTRONGERTOMORROW': 'BUILT FOR A STRONGER TOMORROW'}  # spelling change rejected
+    assert len(sent) == 1 and 'normal text' not in sent[0]
+
+
+def test_repair_sections_applies_everywhere(monkeypatch):
+    monkeypatch.setenv('GROQ_API_KEY', 'test')
+    mapping = {'S A L E S D E S K': 'SALES DESK', 'EMAILADDRESSOFFICE': 'EMAIL ADDRESS OFFICE',
+               'P A C K': 'PACK', 'D I C O N F I P C O': 'DICON FIPCO'}
+    monkeypatch.setattr(text_repair.condense, 'chat_json', lambda s, u, **k: {
+        'fixed': [mapping[line.split('. ', 1)[1]] for line in u.split('ITEMS:\n', 1)[1].splitlines()]})
+    title, sections = text_repair.repair_sections('D I C O N F I P C O', [
+        ('S A L E S D E S K', [{'type': 'para', 'text': 'EMAILADDRESSOFFICE'},
+                               {'type': 'list', 'items': ['P A C K', 'fine'], 'ordered': False},
+                               {'type': 'table', 'rows': [['P A C K', '400 g']]}])])
+    assert title == 'DICON FIPCO' and sections[0][0] == 'SALES DESK'
+    blocks = sections[0][1]
+    assert blocks[0]['text'] == 'EMAIL ADDRESS OFFICE' and blocks[1]['items'] == ['PACK', 'fine']
+    assert blocks[2]['rows'] == [['PACK', '400 g']]
+
+
+def test_repair_without_key_is_a_no_op(monkeypatch):
+    monkeypatch.delenv('GROQ_API_KEY', raising=False)
+    monkeypatch.delenv('LLM_API_KEY', raising=False)
+    monkeypatch.setattr(text_repair.condense, 'chat_json', lambda *a, **k: pytest.fail('should not call the LLM'))
+    assert text_repair.repair_strings(['P R O D U C T']) == {}
+
+
+# ---------- table layout ----------
+def _text_boxes_fit(prs):
+    """Every text box's estimated content height stays inside the slide."""
+    from deck_builder import SLIDE_H
+    for n, slide in enumerate(prs.slides, 1):
+        for sh in slide.shapes:
+            if sh.shape_type in (17, 19):  # text boxes and tables (decorative circles bleed on purpose)
+                assert Emu(sh.top + sh.height).inches <= SLIDE_H + 0.01, f'slide {n}: content runs off the slide'
+
+
+def test_long_text_with_table_flows_onto_its_own_slides():
+    from deck_builder import build_deck
+    long_text = [{'type': 'sub', 'text': f'Point {i}'} if i % 2 else
+                 {'type': 'para', 'text': 'Extreme pressure performance protects against metal contact. ' * 4}
+                 for i in range(14)]
+    table = {'type': 'table', 'rows': [['Product code', 'Class', 'Pack']] +
+             [[f'DG-{i}', 'Multi-purpose water resistant extreme duty grease for chassis points', '400 g cartridge']
+              for i in range(20)]}
+    buffer, slides = build_deck('Brochure', [('Built for a stronger tomorrow', long_text + [table])])
+    prs = Presentation(buffer)
+    tables = [sh.table for s in prs.slides for sh in s.shapes if sh.has_table]
+    assert len(tables) >= 2  # the 21-row table was split
+    assert sum(len(t.rows) - 1 for t in tables) == 20  # every data row kept once, header repeated
+    assert all(t.cell(0, 0).text == 'Product code' for t in tables)
+    text = ' '.join(sh.text_frame.text for s in prs.slides for sh in s.shapes if sh.has_text_frame)
+    assert 'Point 13' in text and '(table)' in text
+    _text_boxes_fit(prs)
+
+
+def test_short_text_sits_beside_small_table():
+    from deck_builder import build_deck
+    blocks = [{'type': 'para', 'text': 'Nigeria leads by capacity.'},
+              {'type': 'table', 'rows': [['Country', 'MW'], ['Nigeria', '1,850'], ['Ghana', '980']]}]
+    buffer, slides = build_deck('T', [('Market', blocks)])
+    assert slides == 3  # cover, one table slide, closing
+
+
+def test_every_table_in_a_section_is_rendered():
+    from deck_builder import build_deck
+    t = lambda name: {'type': 'table', 'rows': [['Name', 'Value'], [name, '1']]}  # noqa: E731
+    buffer, _ = build_deck('T', [('Two tables', [{'type': 'para', 'text': 'Intro.'}, t('first'), t('second')])])
+    cells = [sh.table.cell(1, 0).text for s in Presentation(buffer).slides for sh in s.shapes if sh.has_table]
+    assert cells == ['first', 'second']
