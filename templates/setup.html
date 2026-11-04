@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <title>Storage Setup</title>
+  {% include '_styles.html' %}
+  <style>
+    .checks { list-style: none; padding: 0; margin: 0 0 20px; }
+    .checks li { padding: 6px 0; border-bottom: 1px solid var(--line); display: flex; gap: 10px; }
+    .checks li:last-child { border-bottom: 0; }
+    .ok { color: #2c7a4b; font-weight: 700; }
+    .bad { color: var(--error); font-weight: 700; }
+    .field { margin-top: 16px; }
+    .field input { width: 100%; }
+    .result { margin-top: 20px; padding: 14px 16px; border-radius: 10px; background: var(--tint); color: var(--ink); }
+    .result.error { color: var(--error); }
+    code { font-size: .9em; }
+  </style>
+</head>
+<body>
+<main class="wrap">
+  <header>
+    <h1>Storage setup</h1>
+    <p class="lede">One-time setup for Backblaze B2 uploads. It lets browsers upload PDFs to your bucket and
+      deletes old files after about two days. Run it again any time; it only replaces this app's own rules.</p>
+  </header>
+
+  <section class="card">
+    <h2 style="margin-top:0;color:var(--ink);font-size:1.1rem">Vercel settings</h2>
+    <ul class="checks">
+      {% for name, present in env_checks %}
+      <li><span class="{{ 'ok' if present else 'bad' }}">{{ '✓' if present else '✗' }}</span>
+        <code>{{ name }}</code>{% if not present %}&nbsp;is missing{% endif %}</li>
+      {% endfor %}
+    </ul>
+    {% if not ready %}
+    <p class="mode-desc warn">Add the missing settings in Vercel (Settings, then Environment Variables), redeploy,
+      then reload this page.</p>
+    {% else %}
+    <p class="mode-desc">Bucket: <strong>{{ bucket }}</strong></p>
+    <form method="post" autocomplete="off">
+      <label class="field">
+        <span>Master keyID</span>
+        <input type="text" name="key_id" required spellcheck="false">
+      </label>
+      <label class="field">
+        <span>Master applicationKey</span>
+        <input type="password" name="key" required spellcheck="false">
+      </label>
+      <label class="field">
+        <span>Only allow uploads from <em>(optional)</em></span>
+        <input type="text" name="origins" placeholder="https://your-app.vercel.app, https://another-domain.com"
+               spellcheck="false">
+      </label>
+      <p class="hint">The master key is used for this request only. It is not saved or logged.</p>
+      <button type="submit">Set up bucket</button>
+    </form>
+    {% endif %}
+
+    {% if result %}
+    <div class="result{{ ' error' if result.error }}">
+      {% if result.error %}
+        {{ result.error }}
+      {% else %}
+        <strong>Bucket "{{ result.bucket }}" is ready.</strong><br>
+        Uploads allowed from: {{ result.origins | join(', ') }}<br>
+        Auto-delete: uploads/ and outputs/ after about 2 days<br>
+        {% if result.app_key_problem %}
+          <span class="bad">App key check failed:</span> {{ result.app_key_problem }}
+        {% else %}
+          <span class="ok">✓</span> App key can write and delete files.<br>
+          <a href="/">Go to the converter</a>. The upload box should say "Up to {{ max_mb }} MB".
+        {% endif %}
+      {% endif %}
+    </div>
+    {% endif %}
+  </section>
+</main>
+</body>
+</html>

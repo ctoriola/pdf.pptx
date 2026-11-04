@@ -429,3 +429,99 @@ def test_presign_matches_botocore(monkeypatch, method, key, headers):
         monkeypatch.setenv(k, v)
     expected, now = _botocore_url(method, key, headers, 900)
     assert storage.presign(method, key, 900, headers, now=now) == expected
+
+
+# ---------- /setup page (Backblaze API stubbed) ----------
+class FakeB2Api:
+    def __init__(self, restricted=False, bucket_exists=True):
+        self.restricted, self.bucket_exists, self.calls = restricted, bucket_exists, []
+
+    def response(self, status, body):
+        class R:
+            status_code = status
+            text = json.dumps(body)
+
+            def json(self):
+                return body
+        return R()
+
+    def get(self, url, headers=None, timeout=None):
+        self.calls.append(('auth', headers['Authorization']))
+        if headers['Authorization'] == 'Basic ' + __import__('base64').b64encode(b'bad:bad').decode():
+            return self.response(401, {'message': 'unauthorized'})
+        return self.response(200, {'apiUrl': 'https://api005.backblazeb2.com', 'authorizationToken': 'tok',
+                                   'accountId': 'acc', 'allowed': {'bucketId': 'b1' if self.restricted else None}})
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.calls.append((url.rsplit('/', 1)[-1], json))
+        if url.endswith('b2_list_buckets'):
+            buckets = [{'bucketId': 'bid', 'bucketName': json['bucketName'],
+                        'lifecycleRules': [{'fileNamePrefix': 'keep/', 'daysFromHidingToDeleting': 3}],
+                        'corsRules': [{'corsRuleName': 'other'}]}] if self.bucket_exists else []
+            return self.response(200, {'buckets': buckets})
+        return self.response(200, {'bucketName': 'my-bucket'})
+
+
+@pytest.fixture
+def setup_client(monkeypatch):
+    for k, v in B2_ENV.items():
+        monkeypatch.setenv(k, v)
+    import app as webapp
+    import b2_admin
+    api = FakeB2Api()
+    monkeypatch.setattr(b2_admin.requests, 'get', api.get)
+    monkeypatch.setattr(b2_admin.requests, 'post', api.post)
+    monkeypatch.setattr(b2_admin, 'check_app_key', lambda: None)
+    return webapp.app.test_client(), api
+
+
+def test_setup_page_lists_missing_settings(monkeypatch):
+    for k in B2_ENV:
+        monkeypatch.delenv(k, raising=False)
+    import app as webapp
+    html = webapp.app.test_client().get('/setup').data.decode()
+    assert 'B2_BUCKET</code>&nbsp;is missing' in html and '<form' not in html
+
+
+def test_setup_configures_cors_and_lifecycle_without_echoing_key(setup_client):
+    client, api = setup_client
+    res = client.post('/setup', data={'key_id': 'master', 'key': 'SUPERSECRET', 'origins': ''})
+    html = res.data.decode()
+    assert res.status_code == 200 and 'is ready' in html and 'App key can write' in html
+    assert 'SUPERSECRET' not in html and res.headers['Cache-Control'] == 'no-store'
+    update = next(p for name, p in api.calls if name == 'b2_update_bucket')
+    assert update['bucketType'] == 'allPrivate'
+    assert [r['corsRuleName'] for r in update['corsRules']] == ['other', 'pdfToSlidesUploads']
+    assert update['corsRules'][1]['allowedOrigins'] == ['*'] and 's3_put' in update['corsRules'][1]['allowedOperations']
+    assert [r['fileNamePrefix'] for r in update['lifecycleRules']] == ['keep/', 'uploads/', 'outputs/']
+
+
+def test_setup_restricts_origins(setup_client):
+    client, api = setup_client
+    client.post('/setup', data={'key_id': 'm', 'key': 'k', 'origins': 'https://a.vercel.app/, https://b.com'})
+    update = next(p for name, p in api.calls if name == 'b2_update_bucket')
+    assert update['corsRules'][-1]['allowedOrigins'] == ['https://a.vercel.app', 'https://b.com']
+
+
+def test_setup_reports_wrong_or_restricted_key(setup_client):
+    client, api = setup_client
+    assert 'rejected the key' in client.post('/setup', data={'key_id': 'bad', 'key': 'bad'}).data.decode()
+    api.restricted = True
+    assert 'MASTER application key' in client.post('/setup', data={'key_id': 'm', 'key': 'k'}).data.decode()
+    api.restricted, api.bucket_exists = False, False
+    assert 'no bucket named' in client.post('/setup', data={'key_id': 'm', 'key': 'k'}).data.decode()
+
+
+def test_check_app_key_reports_write_failure(monkeypatch):
+    for k, v in B2_ENV.items():
+        monkeypatch.setenv(k, v)
+    import b2_admin
+
+    class R:
+        def __init__(self, code):
+            self.status_code = code
+    monkeypatch.setattr(b2_admin.requests, 'put', lambda *a, **k: R(403))
+    assert 'could not write' in b2_admin.check_app_key()
+    monkeypatch.setattr(b2_admin.requests, 'put', lambda *a, **k: R(200))
+    monkeypatch.setattr(b2_admin.requests, 'delete', lambda *a, **k: R(204))
+    assert b2_admin.check_app_key() is None

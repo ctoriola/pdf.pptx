@@ -58,6 +58,30 @@ def index():
                            cloud_upload=use_storage)
 
 
+B2_SETTINGS = ('B2_KEY_ID', 'B2_APPLICATION_KEY', 'B2_BUCKET', 'B2_ENDPOINT')
+
+
+@app.route('/setup', methods=['GET', 'POST'])
+def setup():
+    """One-time B2 bucket setup (CORS for browser uploads + auto-delete), using the master key."""
+    import b2_admin
+
+    result = None
+    if request.method == 'POST' and storage.enabled():
+        origins = (request.form.get('origins') or '').replace(',', ' ').split()
+        try:
+            result = b2_admin.configure_bucket(request.form.get('key_id', ''), request.form.get('key', ''),
+                                               os.environ['B2_BUCKET'], origins)
+            result['app_key_problem'] = b2_admin.check_app_key()
+        except b2_admin.SetupError as exc:
+            result = {'error': str(exc)}
+    resp = app.make_response(render_template(
+        'setup.html', env_checks=[(k, bool(os.environ.get(k))) for k in B2_SETTINGS], ready=storage.enabled(),
+        bucket=os.environ.get('B2_BUCKET', ''), result=result, max_mb=f'{storage.MAX_STORAGE_UPLOAD_MB:g}'))
+    resp.headers['Cache-Control'] = 'no-store'
+    return resp
+
+
 @app.post('/upload-url')
 def upload_url():
     """A one-time B2 upload link for a PDF of the stated size."""

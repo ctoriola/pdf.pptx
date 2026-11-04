@@ -68,14 +68,16 @@ Vercel functions accept and return at most 4.5 MB. When B2 is configured, the br
 one-time upload link from `/upload-url` and uploads the PDF straight to a private B2 bucket (up to
 **100 MB**; the size is signed into the link, so B2 rejects anything else). The function downloads it,
 converts it, deletes it, and returns the deck as a download link that expires after 1 hour.
-**Setup guide: [`docs/B2_Setup_Guide.pdf`](docs/B2_Setup_Guide.pdf)**
-(also as [`docs/B2_SETUP.md`](docs/B2_SETUP.md)).
+Setup: create a private bucket and a bucket-limited Read and Write key in Backblaze, add the four
+`B2_*` variables in Vercel and redeploy, then open **`/setup`** on the site once and paste the account's
+master key. That sets the bucket's CORS rule (browser uploads) and auto-delete rules, and checks the
+app key. The master key is used for that request only and never stored.
 
 | Piece | File |
 |---|---|
 | Server: presigned links (AWS SigV4, no SDK), download, upload, delete | `storage.py` |
 | Browser: upload with progress | bottom of `templates/index.html` |
-| One-time bucket setup: CORS for browser uploads, auto-delete after ~2 days | `scripts/b2_setup.py` |
+| One-time bucket setup page: CORS for browser uploads, auto-delete after ~2 days | `b2_admin.py`, `templates/setup.html` |
 
 Without the four `B2_*` variables the app falls back to direct uploads:
 

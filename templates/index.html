@@ -4,107 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PDF to Slides</title>
-  <style>
-:root {
-  --accent: #d44c3f;
-  --accent-strong: #b73a2f;
-  --tint: #fef7f6;
-  --ink: #111827;
-  --body: #374151;
-  --muted: #6b7280;
-  --line: #e5e7eb;
-  --bg: #f6f7f9;
-  --card: #ffffff;
-  --error: #b42318;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --tint: #2a1a19;
-    --ink: #f3f4f6;
-    --body: #d1d5db;
-    --muted: #9ca3af;
-    --line: #2f343c;
-    --bg: #14161a;
-    --card: #1d2026;
-    --error: #ff8a80;
-  }
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--body);
-  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-}
-.wrap { max-width: 760px; margin: 0 auto; padding: 48px 16px 64px; }
-h1 { color: var(--ink); font-size: 2rem; margin: 0 0 8px; }
-.lede { margin: 0 0 28px; color: var(--muted); }
-.card {
-  background: var(--card);
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  padding: 24px;
-}
-.drop {
-  display: flex; flex-direction: column; align-items: center; gap: 4px;
-  border: 2px dashed var(--line); border-radius: 12px;
-  padding: 32px 16px; cursor: pointer; text-align: center;
-  transition: border-color .15s, background .15s;
-}
-.drop:hover, .drop.over { border-color: var(--accent); background: var(--tint); }
-.drop input { position: absolute; width: 1px; height: 1px; opacity: 0; }
-.drop-title { color: var(--ink); font-weight: 600; word-break: break-all; }
-.hint { color: var(--muted); font-size: .875rem; }
-fieldset { border: 0; padding: 0; margin: 24px 0 0; }
-legend, .field > span { color: var(--ink); font-weight: 600; margin-bottom: 8px; display: block; }
-.modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
-@media (max-width: 640px) { .modes { grid-template-columns: 1fr; } }
-.mode {
-  display: flex; gap: 10px; align-items: flex-start;
-  border: 1px solid var(--line); border-radius: 10px; padding: 14px; cursor: pointer;
-}
-.mode:has(input:checked) { border-color: var(--accent); background: var(--tint); }
-.mode.disabled { opacity: .55; cursor: not-allowed; }
-.mode input { margin-top: 4px; accent-color: var(--accent); }
-.mode-body { display: flex; flex-direction: column; gap: 4px; }
-.mode-title { color: var(--ink); font-weight: 600; }
-.mode-desc { color: var(--muted); font-size: .875rem; }
-.mode-desc.warn { color: var(--error); }
-.tag {
-  font-size: .7rem; font-weight: 700; color: var(--accent-strong);
-  border: 1px solid var(--accent); border-radius: 999px; padding: 0 6px; vertical-align: middle;
-}
-.row { display: flex; gap: 16px; margin-top: 24px; flex-wrap: wrap; }
-.field { display: flex; flex-direction: column; }
-.field.grow { flex: 1; min-width: 220px; }
-.field em { font-weight: 400; color: var(--muted); font-style: normal; }
-select, input[type=text] {
-  font: inherit; color: var(--ink); background: var(--card);
-  border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px;
-}
-button, .button {
-  display: inline-block; font: inherit; font-weight: 600; text-decoration: none; cursor: pointer;
-  background: var(--accent); color: #fff; border: 0; border-radius: 10px; padding: 12px 20px;
-}
-button:hover, .button:hover { background: var(--accent-strong); }
-form button[type=submit] { margin-top: 28px; width: 100%; }
-.button.secondary { background: transparent; color: var(--accent-strong); border: 1px solid var(--accent); }
-.button.secondary:hover { background: var(--tint); }
-.link { background: none; color: var(--accent-strong); padding: 0; margin-top: 16px; }
-.link:hover { background: none; text-decoration: underline; }
-#progress { text-align: center; }
-#message { color: var(--ink); margin: 12px 0 0; }
-#message.error { color: var(--error); }
-.done-title { color: var(--muted); }
-.actions { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin-top: 8px; }
-.spinner {
-  width: 36px; height: 36px; margin: 0 auto;
-  border: 3px solid var(--line); border-top-color: var(--accent); border-radius: 50%;
-  animation: spin .9s linear infinite;
-}
-.spinner[hidden] { display: none; }
-@keyframes spin { to { transform: rotate(360deg); } }
-  </style>
+  {% include '_styles.html' %}
 </head>
 <body>
 <main class="wrap">
@@ -339,7 +239,7 @@ form button[type=submit] { margin-top: 28px; width: 100%; }
       xhr.onload = () => xhr.status < 300 ? resolve()
         : reject(fail('The upload was refused by storage. Please try again.', xhr.status + ' ' + xhr.responseText));
       xhr.onerror = () => reject(fail('The upload could not reach storage. If this keeps happening, '
-                                      + 'the bucket\'s CORS rule is missing (see the setup guide, Part 4).', 'network/CORS'));
+                                      + 'the bucket setup has not been run yet (open /setup on this site).', 'network/CORS'));
       xhr.send(file);
     });
     return { path: data.path };
