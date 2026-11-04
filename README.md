@@ -92,7 +92,7 @@ python convert.py out/markdown/document.md --mode standard   # rebuild from Mark
 ## Tests
 
 ```bash
-pip install pytest reportlab
+pip install pytest
 python -m pytest -q
 ```
 
