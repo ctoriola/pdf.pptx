@@ -248,17 +248,17 @@ form button[type=submit] { margin-top: 28px; width: 100%; }
     document.body.appendChild(a); a.click(); a.remove();
   }
 
-  // Cloud route: upload to Firebase Storage, then send only the file's path
+  // Cloud route: upload to Backblaze B2, then send only the file's path
   async function convertViaCloud(file, mode, usesLlm) {
     show('running', 'Uploading… 0%', 'Keep this tab open.');
-    const { path, token } = await window.cloudUpload(file, pct => show('running', `Uploading… ${pct}%`, 'Keep this tab open.'));
+    const { path } = await window.cloudUpload(file, pct => show('running', `Uploading… ${pct}%`, 'Keep this tab open.'));
     startTicker(usesLlm);
     const body = Object.fromEntries(lastForm.entries());
     delete body.pdf;
     Object.assign(body, { storage_path: path, filename: file.name });
     const res = await fetch('/convert', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
     if (!res.ok) return show('error', await errorText(res));
@@ -321,41 +321,28 @@ form button[type=submit] { margin-top: 28px; width: 100%; }
   });
 })();
 </script>
-{% if firebase_config %}
-<script type="module">
-  // Firebase Storage upload: anonymous sign-in, then uploads/<uid>/<random id>.pdf
-  import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
-  import { getAuth, signInAnonymously } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
-  import { getStorage, ref, uploadBytesResumable } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js';
-
-  const fb = initializeApp({{ firebase_config | tojson }});
-  const auth = getAuth(fb);
-  const store = getStorage(fb);
-
-  function fail(message, err) {
-    console.error(err);
-    const e = new Error(message); e.userMessage = message; return e;
-  }
-
+{% if cloud_upload %}
+<script>
+  // Backblaze B2 upload: ask the server for a one-time link, then PUT the PDF straight to B2
   window.cloudUpload = async (file, onProgress) => {
-    let user;
-    try {
-      user = auth.currentUser || (await signInAnonymously(auth)).user;
-    } catch (err) {
-      throw fail('Could not start an upload session. Check that Anonymous sign-in is enabled in Firebase.', err);
-    }
-    const id = crypto.randomUUID();
-    const path = `uploads/${user.uid}/${id}.pdf`;
-    await new Promise((resolve, reject) => {
-      const task = uploadBytesResumable(ref(store, path), file, { contentType: 'application/pdf' });
-      task.on('state_changed',
-        snap => onProgress(Math.round(100 * snap.bytesTransferred / Math.max(snap.totalBytes, 1))),
-        err => reject(fail(err.code === 'storage/unauthorized'
-          ? 'The upload was refused. Only PDFs within the size limit can be uploaded.'
-          : 'The upload failed. Check your connection and try again.', err)),
-        resolve);
+    const fail = (message, detail) => { console.error(detail); const e = new Error(message); e.userMessage = message; return e; };
+    const res = await fetch('/upload-url', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ size: file.size }),
     });
-    return { path, token: await user.getIdToken() };
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw fail(data.error || 'Could not start the upload.', res.status);
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('PUT', data.url);
+      Object.entries(data.headers || {}).forEach(([k, v]) => xhr.setRequestHeader(k, v));
+      xhr.upload.onprogress = ev => { if (ev.lengthComputable) onProgress(Math.round(100 * ev.loaded / ev.total)); };
+      xhr.onload = () => xhr.status < 300 ? resolve()
+        : reject(fail('The upload was refused by storage. Please try again.', xhr.status + ' ' + xhr.responseText));
+      xhr.onerror = () => reject(fail('The upload could not reach storage. If this keeps happening, '
+                                      + 'the bucket\'s CORS rule is missing (see the setup guide, Part 4).', 'network/CORS'));
+      xhr.send(file);
+    });
+    return { path: data.path };
   };
 </script>
 {% endif %}

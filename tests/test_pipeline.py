@@ -267,7 +267,7 @@ def test_shrink_pptx_recompresses_pictures(tmp_path):
 # ---------- web app ----------
 @pytest.fixture
 def client(monkeypatch):
-    monkeypatch.delenv('FIREBASE_SERVICE_ACCOUNT', raising=False)
+    monkeypatch.delenv('B2_KEY_ID', raising=False)
     monkeypatch.delenv('GROQ_API_KEY', raising=False)
     monkeypatch.delenv('LLM_API_KEY', raising=False)
     import app as webapp
@@ -308,11 +308,17 @@ def test_bold_lines_become_headings():
     assert '**Bold sentence.**' in out  # ends like a sentence, so it stays body text
 
 
-# ---------- Firebase Storage route (Google APIs stubbed) ----------
-class FakeStorage:
+# ---------- Backblaze B2 route (HTTP to B2 stubbed) ----------
+import storage  # noqa: E402
+
+B2_ENV = {'B2_KEY_ID': '005abc', 'B2_APPLICATION_KEY': 'K005secretSECRET/+=', 'B2_BUCKET': 'my-bucket',
+          'B2_ENDPOINT': 's3.us-east-005.backblazeb2.com'}
+
+
+class FakeB2:
     """Stands in for the bucket: 'uploads' maps paths to local files, 'outputs' records results."""
-    def __init__(self, tmp_path):
-        self.tmp, self.uploads, self.outputs, self.deleted = tmp_path, {}, {}, []
+    def __init__(self):
+        self.uploads, self.outputs, self.deleted = {}, {}, []
 
     def download(self, path, dest):
         if path not in self.uploads:
@@ -328,70 +334,98 @@ class FakeStorage:
 
 
 @pytest.fixture
-def cloud(monkeypatch, tmp_path):
-    import storage as storage_mod
-    for key in ('FIREBASE_SERVICE_ACCOUNT', 'FIREBASE_STORAGE_BUCKET', 'FIREBASE_PROJECT_ID',
-                'FIREBASE_API_KEY', 'FIREBASE_APP_ID'):
-        monkeypatch.setenv(key, 'x')
+def cloud(monkeypatch):
+    for k, v in B2_ENV.items():
+        monkeypatch.setenv(k, v)
     monkeypatch.delenv('GROQ_API_KEY', raising=False)
-    fake = FakeStorage(tmp_path)
-    monkeypatch.setattr(storage_mod, 'download', fake.download)
-    monkeypatch.setattr(storage_mod, 'upload_result', fake.upload_result)
-    monkeypatch.setattr(storage_mod, 'delete', fake.delete)
-    monkeypatch.setattr(storage_mod, 'verify_user',
-                        lambda h: 'user1' if h == 'Bearer good' else (_ for _ in ()).throw(storage_mod.AuthError('bad')))
+    fake = FakeB2()
+    monkeypatch.setattr(storage, 'download', fake.download)
+    monkeypatch.setattr(storage, 'upload_result', fake.upload_result)
+    monkeypatch.setattr(storage, 'delete', fake.delete)
     import app as webapp
     return webapp.app.test_client(), fake
 
 
-import storage  # noqa: E402
+def test_upload_url_signs_size_and_enforces_limit(cloud):
+    client, _ = cloud
+    res = client.post('/upload-url', json={'size': 60 * 1024 * 1024})
+    assert res.status_code == 200
+    data = res.json
+    assert storage.UPLOAD_PATH_RE.match(data['path'])
+    assert data['url'].startswith('https://s3.us-east-005.backblazeb2.com/my-bucket/uploads/')
+    assert 'X-Amz-SignedHeaders=content-length%3Bcontent-type%3Bhost' in data['url']
+    assert client.post('/upload-url', json={'size': 101 * 1024 * 1024}).status_code == 400
+    assert client.post('/upload-url', json={}).status_code == 400
 
 
-def test_cloud_convert_returns_signed_links_and_deletes_pdf(cloud):
+def test_cloud_convert_returns_links_and_deletes_pdf(cloud):
     client, fake = cloud
-    path = 'uploads/user1/abcdef12-3456.pdf'
+    path = 'uploads/' + 'ab' * 16 + '.pdf'
     fake.uploads[path] = SAMPLE_PDF
-    res = client.post('/convert', json={'storage_path': path, 'filename': 'report.pdf', 'mode': 'standard'},
-                      headers={'Authorization': 'Bearer good'})
+    res = client.post('/convert', json={'storage_path': path, 'filename': 'report.pdf', 'mode': 'standard'})
     assert res.status_code == 200, res.data[:300]
     data = res.json
-    assert data['download_url'].startswith('https://signed.example/outputs/user1/abcdef12-3456/')
+    assert data['download_url'].startswith('https://signed.example/outputs/' + 'ab' * 16 + '/')
     assert data['markdown_url'].endswith('_markdown.zip') and data['slides'] >= 5
     deck = next(v for k, v in fake.outputs.items() if k.endswith('.pptx'))
     assert len(pictures(Presentation(__import__('io').BytesIO(deck)))) == 3
     assert fake.deleted == [path]
 
 
-def test_cloud_rejects_other_users_paths_and_bad_tokens(cloud):
+def test_cloud_rejects_bad_paths(cloud):
     client, fake = cloud
-    fake.uploads['uploads/user2/abcdef12-3456.pdf'] = SAMPLE_PDF
-    res = client.post('/convert', json={'storage_path': 'uploads/user2/abcdef12-3456.pdf'},
-                      headers={'Authorization': 'Bearer good'})
-    assert res.status_code == 403
-    res = client.post('/convert', json={'storage_path': 'uploads/user1/../../secret.pdf'},
-                      headers={'Authorization': 'Bearer good'})
-    assert res.status_code == 403
-    res = client.post('/convert', json={'storage_path': 'uploads/user1/abcdef12-3456.pdf'},
-                      headers={'Authorization': 'Bearer forged'})
-    assert res.status_code == 401
+    for bad in ('uploads/../outputs/x.pdf', 'outputs/' + 'ab' * 16 + '.pdf', 'uploads/short.pdf'):
+        res = client.post('/convert', json={'storage_path': bad})
+        assert res.status_code == 400, bad
+    res = client.post('/convert', json={'storage_path': 'uploads/' + 'cd' * 16 + '.pdf'})
+    assert res.status_code == 400 and 'not found' in res.json['error']
     assert fake.outputs == {}
 
 
-def test_cloud_page_includes_firebase_config(cloud):
+def test_cloud_page_mentions_100mb(cloud):
     client, _ = cloud
     html = client.get('/').data.decode()
-    assert 'firebase-storage.js' in html and 'Up to 50 MB' in html
+    assert 'window.cloudUpload' in html and 'Up to 100 MB' in html
 
 
-def test_page_without_firebase_uses_direct_upload(client):
-    html = client.get('/').data.decode()
-    assert 'firebase' not in html
+def test_page_without_b2_uses_direct_upload(client):
+    assert 'cloudUpload =' not in client.get('/').data.decode()
 
 
-def test_service_account_accepts_raw_or_base64(monkeypatch):
-    import base64 as b64
-    raw = '{"project_id": "p", "type": "service_account"}'
-    monkeypatch.setenv('FIREBASE_SERVICE_ACCOUNT', raw)
-    assert storage._service_account_info()['project_id'] == 'p'
-    monkeypatch.setenv('FIREBASE_SERVICE_ACCOUNT', b64.b64encode(raw.encode()).decode())
-    assert storage._service_account_info()['project_id'] == 'p'
+def _botocore_url(method, key, headers, expires):
+    """Presign with Amazon's own botocore at a fixed time, for comparison."""
+    import datetime as dt
+    from unittest import mock
+    botocore = pytest.importorskip('botocore')
+    import botocore.auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+    fixed = dt.datetime(2026, 11, 4, 9, 30, 0)
+
+    class FixedDT(dt.datetime):
+        @classmethod
+        def utcnow(cls):
+            return fixed
+
+        @classmethod
+        def now(cls, tz=None):
+            return fixed.replace(tzinfo=tz) if tz else fixed
+    url = f'https://{B2_ENV["B2_ENDPOINT"]}/{B2_ENV["B2_BUCKET"]}/' + storage._uri_encode(key, safe='-_.~/')
+    req = AWSRequest(method=method, url=url, headers=headers, data=b'')
+    with mock.patch.object(botocore.auth.datetime, 'datetime', FixedDT):
+        botocore.auth.S3SigV4QueryAuth(Credentials(B2_ENV['B2_KEY_ID'], B2_ENV['B2_APPLICATION_KEY']), 's3',
+                                       'us-east-005', expires=expires).add_auth(req)
+    return req.url, fixed.replace(tzinfo=dt.timezone.utc)
+
+
+@pytest.mark.parametrize('method,key,headers', [
+    ('GET', 'outputs/abc/My Deck (v2).pptx', {}),
+    ('PUT', 'uploads/' + 'ab' * 16 + '.pdf', {'Content-Type': 'application/pdf', 'Content-Length': '12345'}),
+    ('PUT', 'outputs/abc/Deck.zip', {'Content-Type': 'application/zip',
+                                     'Content-Disposition': 'attachment; filename="Deck.zip"'}),
+])
+def test_presign_matches_botocore(monkeypatch, method, key, headers):
+    for k, v in B2_ENV.items():
+        monkeypatch.setenv(k, v)
+    expected, now = _botocore_url(method, key, headers, 900)
+    assert storage.presign(method, key, 900, headers, now=now) == expected

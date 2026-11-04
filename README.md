@@ -57,27 +57,27 @@ token limits, and HTTP 429 responses are retried using the `Retry-After` header.
 
 The app is stateless: each request converts in a temporary folder and returns the file, so it
 runs as a single Vercel Python function. Vercel detects Flask from `app.py`, and `.python-version`
-pins Python 3.12. The installed dependencies take about 370 MB, under the 500 MB function limit.
+pins Python 3.12. The installed dependencies take about 330 MB, under the 500 MB function limit.
 
 1. Import the repo in Vercel. No build settings are needed.
 2. Add `GROQ_API_KEY` under Project → Settings → Environment Variables.
 
-### Large PDFs: Firebase Storage
+### Large PDFs: Backblaze B2 (free, no card)
 
-Vercel functions accept and return at most 4.5 MB. When Firebase Storage is configured, the
-browser uploads the PDF straight to Storage (up to 50 MB), the function gets only the file's path,
-and the deck comes back as a signed link that expires after 1 hour. **Setup guide:
-[`docs/Firebase_Setup_Guide.pdf`](docs/Firebase_Setup_Guide.pdf)**
-(also as [`docs/FIREBASE_SETUP.md`](docs/FIREBASE_SETUP.md)).
+Vercel functions accept and return at most 4.5 MB. When B2 is configured, the browser gets a
+one-time upload link from `/upload-url` and uploads the PDF straight to a private B2 bucket (up to
+**100 MB**; the size is signed into the link, so B2 rejects anything else). The function downloads it,
+converts it, deletes it, and returns the deck as a download link that expires after 1 hour.
+**Setup guide: [`docs/B2_Setup_Guide.pdf`](docs/B2_Setup_Guide.pdf)**
+(also as [`docs/B2_SETUP.md`](docs/B2_SETUP.md)).
 
 | Piece | File |
 |---|---|
-| Server: token check, download, upload, signed links | `storage.py` |
-| Browser: anonymous sign-in + resumable upload | bottom of `templates/index.html` |
-| Upload rules (PDF only, <50 MB, own folder only) | `storage.rules` |
-| Auto-delete after 1 day | `lifecycle.json` (or the console steps in the guide) |
+| Server: presigned links (AWS SigV4, no SDK), download, upload, delete | `storage.py` |
+| Browser: upload with progress | bottom of `templates/index.html` |
+| One-time bucket setup: CORS for browser uploads, auto-delete after ~2 days | `scripts/b2_setup.py` |
 
-Without the six `FIREBASE_*` variables the app falls back to direct uploads:
+Without the four `B2_*` variables the app falls back to direct uploads:
 
 | Limit | Effect | How the app handles it |
 |---|---|---|

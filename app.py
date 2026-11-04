@@ -5,8 +5,9 @@ Stateless, so it runs on serverless hosts (Vercel) as well as a normal server: e
 request converts in its own temporary folder.
 
 Two upload routes:
-  - Firebase Storage (when configured): the browser uploads the PDF to Storage and sends
-    its path; the result comes back as a signed download link. No size limit from Vercel.
+  - Backblaze B2 (when configured): the browser gets a one-time upload link from
+    /upload-url, uploads the PDF straight to B2 (up to 100 MB) and sends its path; the
+    result comes back as a signed download link. No size limit from Vercel.
   - Direct: the PDF is posted in the request and the file is returned in the response.
     On Vercel this is capped at 4.5 MB each way.
 """
@@ -54,7 +55,18 @@ def index():
     return render_template('index.html', plans=PLANS, default_mode=DEFAULT_MODE, themes=THEMES,
                            default_theme=DEFAULT_THEME, llm_ready=condense.llm_available(),
                            max_upload_mb=f'{storage.MAX_STORAGE_UPLOAD_MB if use_storage else MAX_UPLOAD_MB:g}',
-                           firebase_config=storage.web_config() if use_storage else None)
+                           cloud_upload=use_storage)
+
+
+@app.post('/upload-url')
+def upload_url():
+    """A one-time B2 upload link for a PDF of the stated size."""
+    if not storage.enabled():
+        return jsonify(error='Cloud uploads are not configured on this server.'), 404
+    try:
+        return jsonify(storage.new_upload((request.get_json(silent=True) or {}).get('size')))
+    except storage.StorageError as exc:
+        return jsonify(error=str(exc)), 400
 
 
 def _options():
@@ -66,7 +78,7 @@ def _receive_pdf(work):
     """
     Put the uploaded PDF at work/input.pdf.
     Returns (pdf_path, filename, ctx); ctx is None for direct uploads, or a dict with the
-    user's uid, the upload id and storage path for Firebase uploads.
+    upload id and storage path for B2 uploads.
     """
     pdf_path = Path(work) / 'input.pdf'
     opts = _options()
@@ -74,14 +86,11 @@ def _receive_pdf(work):
         if not storage.enabled():
             raise InputError('Cloud uploads are not configured on this server.')
         try:
-            uid = storage.verify_user(request.headers.get('Authorization'))
-            upload_id = storage.check_upload_path(opts['storage_path'], uid)
+            upload_id = storage.check_upload_path(opts['storage_path'])
             storage.download(opts['storage_path'], pdf_path)
-        except storage.AuthError as exc:
-            raise InputError(str(exc), 401)
         except storage.StorageError as exc:
-            raise InputError(str(exc), 403 if 'belong' in str(exc) else 400)
-        ctx = {'uid': uid, 'id': upload_id, 'path': opts['storage_path']}
+            raise InputError(str(exc))
+        ctx = {'id': upload_id, 'path': opts['storage_path']}
         filename = (opts.get('filename') or 'document.pdf')[:200]
     else:
         upload = request.files.get('pdf')
@@ -99,7 +108,7 @@ def _deliver(local_path, download_name, mimetype, ctx, extra=None):
     """Signed Storage link (JSON) for cloud uploads; the file itself for direct uploads."""
     extra = extra or {}
     if ctx:
-        url = storage.upload_result(local_path, f'outputs/{ctx["uid"]}/{ctx["id"]}/{download_name}',
+        url = storage.upload_result(local_path, f'outputs/{ctx["id"]}/{download_name}',
                                     download_name, mimetype)
         return jsonify(download_url=url, filename=download_name, **extra)
     out = io.BytesIO(Path(local_path).read_bytes())
@@ -138,7 +147,7 @@ def convert_route():
                 # The PDF is deleted after this request, so hand back the Markdown link now too
                 zip_path = _zip_markdown(md_path, Path(work) / (pptx_path.stem + '_markdown.zip'))
                 extra['markdown_url'] = storage.upload_result(
-                    zip_path, f'outputs/{ctx["uid"]}/{ctx["id"]}/{zip_path.name}', zip_path.name, 'application/zip')
+                    zip_path, f'outputs/{ctx["id"]}/{zip_path.name}', zip_path.name, 'application/zip')
             return _deliver(pptx_path, pptx_path.name, PPTX_MIME, ctx, extra)
         except InputError as exc:
             return jsonify(error=str(exc)), exc.status

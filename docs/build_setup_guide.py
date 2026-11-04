@@ -1,210 +1,171 @@
 """
-Builds the Firebase setup guide as Markdown (docs/FIREBASE_SETUP.md) and PDF
-(docs/Firebase_Setup_Guide.pdf) from one source. Run: python docs/build_setup_guide.py
+Builds the Backblaze B2 setup guide as Markdown (docs/B2_SETUP.md) and PDF
+(docs/B2_Setup_Guide.pdf) from one source. Run: python docs/build_setup_guide.py
 Needs reportlab (pip install reportlab); not a runtime dependency of the app.
 """
 import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-RULES = (ROOT / 'storage.rules').read_text().strip()
 
-TITLE = 'Firebase Storage Setup Guide'
-SUBTITLE = 'PDF to Slides: lifting the 4.4 MB upload limit on Vercel'
+TITLE = 'Backblaze B2 Setup Guide'
+SUBTITLE = 'PDF to Slides: uploads up to 100 MB on Vercel, no card needed'
+MD_NAME, PDF_NAME = 'B2_SETUP.md', 'B2_Setup_Guide.pdf'
 
 INTRO = [
-    'Vercel rejects any request larger than 4.5 MB. With Firebase Storage, the browser uploads the PDF '
-    'straight to Google\'s storage, sends the app only the file\'s location, and gets the finished deck back as a '
-    'download link. Uploads of up to 50 MB work, and large decks no longer need recompressing.',
-    'The code is already in the repository. This guide covers the accounts and settings only. '
-    'It takes about 20 minutes. Do the parts in order; each step is one action.',
-    'Firebase and Google Cloud rename menu items from time to time. If a label doesn\'t match exactly, '
-    'look for the closest equivalent on the same page.',
+    'Vercel rejects any request larger than 4.5 MB. With Backblaze B2, the browser uploads the PDF '
+    'straight to B2 using a one-time link from the app, the app converts it, and the finished deck comes back as '
+    'a download link. PDFs of up to 100 MB work, and large decks no longer need recompressing.',
+    'B2 gives you 10 GB free with no card. The app deletes each PDF as soon as it is converted, and the bucket '
+    'clears everything else after about two days, so you will use a tiny fraction of that.',
+    'The code is already in the repository. This guide covers the account and settings only, and takes about '
+    '20 minutes. Do the parts in order; each step is one action. If a button label differs slightly, look for the '
+    'closest match on the same page.',
 ]
 
 CHECKLIST = [
-    ('Project ID', 'Part 1, step 6', 'pdf-to-slides-4f2a1'),
-    ('Bucket name', 'Part 3, step 9', 'pdf-to-slides-4f2a1.firebasestorage.app'),
-    ('apiKey', 'Part 6, step 6', 'AIzaSy...'),
-    ('authDomain', 'Part 6, step 6', 'pdf-to-slides-4f2a1.firebaseapp.com'),
-    ('appId', 'Part 6, step 6', '1:1234567890:web:abc123...'),
-    ('Service-account JSON file', 'Part 7, step 5', 'a downloaded .json file'),
+    ('Bucket name', 'Part 2, step 6', 'pdf-slides-blessing'),
+    ('Endpoint', 'Part 2, step 12', 's3.us-east-005.backblazeb2.com'),
+    ('Master keyID + applicationKey', 'Part 3, step 6', 'used once in Part 4, not stored'),
+    ('App keyID', 'Part 5, step 9', '005a1b2c3d4e5f60000000001'),
+    ('App applicationKey', 'Part 5, step 9', 'K005abcd... (shown only once)'),
 ]
 
 PARTS = [
     {
-        'title': 'Part 1: Create the Firebase project',
+        'title': 'Part 1: Create a free Backblaze account',
         'steps': [
-            'Open <b>console.firebase.google.com</b> in your browser.',
-            'Sign in with the Google account you want to own the project.',
-            'Click <b>Create a project</b> (or <b>Add project</b>, or <b>Create a Firebase project</b>).',
-            'Type a project name, for example <b>pdf-to-slides</b>.',
-            'Look under the name field: Firebase shows the <b>project ID</b> it will use (for example pdf-to-slides-4f2a1).',
-            'Write the project ID down. You need it in Part 9.',
-            'Tick the terms checkbox if asked, then click <b>Continue</b>.',
-            'If asked about AI assistance (Gemini), choose either option. It doesn\'t affect this app.',
-            'On the Google Analytics screen, switch Analytics <b>off</b>. The app doesn\'t use it.',
-            'Click <b>Create project</b>.',
-            'Wait for "Your new project is ready", then click <b>Continue</b>.',
+            'Open <b>backblaze.com</b> in your browser.',
+            'Click <b>Sign Up</b>, then choose <b>B2 Cloud Storage</b> (not Computer Backup).',
+            'Enter your email address and a password.',
+            'When asked for a region, choose <b>US East</b>. It is closest to Vercel\'s Washington servers, '
+            'which keeps uploads and conversions fast.',
+            'Click <b>Sign Up for B2</b> (or <b>Create Account</b>).',
+            'Open the verification email from Backblaze and click the link in it.',
+            'Sign back in at <b>secure.backblaze.com</b> if you are not taken there automatically.',
+        ],
+        'note': 'No card is needed. Without a card on file Backblaze cannot charge you; at worst, a request over a '
+                'free daily allowance is refused until the next day.',
+    },
+    {
+        'title': 'Part 2: Create the bucket',
+        'steps': [
+            'In the left menu, under B2 Cloud Storage, click <b>Buckets</b>.',
+            'Click <b>Create a Bucket</b>.',
+            'Type a bucket name. It must be unique across all of Backblaze: 6 to 63 characters, letters, '
+            'numbers and hyphens only.',
+            'If the name is taken, add something personal, for example <b>pdf-slides-blessing</b>.',
+            'Check that the name is accepted (no red warning).',
+            'Write the bucket name down.',
+            'Set <b>Files in Bucket are</b> to <b>Private</b>.',
+            'Leave <b>Default Encryption</b> on Disable.',
+            'Leave <b>Object Lock</b> on Disable.',
+            'Click <b>Create a Bucket</b>.',
+            'Find your new bucket on the Buckets page.',
+            'In its details, find <b>Endpoint</b> (it looks like s3.us-east-005.backblazeb2.com) and write it '
+            'down exactly.',
         ],
     },
     {
-        'title': 'Part 2: Switch the project to the Blaze plan',
-        'intro': 'New projects must be on the pay-as-you-go Blaze plan to use Storage. Google\'s free monthly '
-                 'allowance still applies, and this app deletes every file within a day, so usage stays tiny.',
+        'title': 'Part 3: Get the master key (for setup only)',
+        'intro': 'Two bucket settings (browser uploads and auto-delete) can only be set with your master key. '
+                 'You use it once in Part 4. The app itself never gets it.',
         'steps': [
-            'In the left sidebar, at the bottom, find the plan label <b>Spark</b>.',
-            'Click <b>Upgrade</b> next to it.',
-            'Choose <b>Blaze</b> and click <b>Select plan</b> (or <b>Continue</b>).',
-            'Click <b>Create a Cloud Billing account</b> if you don\'t already have one.',
-            'Choose your country (Nigeria).',
-            'Enter your card details and billing address.',
-            'Click <b>Confirm</b> or <b>Start my free trial</b>, whichever appears.',
-            'When asked to set a budget, enter a small amount, for example <b>1 USD</b>.',
-            'Click <b>Continue</b>, then <b>Link Cloud Billing account</b> (or <b>Purchase</b>).',
-            'Check that the sidebar label now says <b>Blaze</b>.',
-        ],
-        'note': 'A budget only sends you alert emails; it does not stop spending. For a personal tool with files '
-                'deleted daily, expect a bill of zero or a few cents.',
-    },
-    {
-        'title': 'Part 3: Turn on Storage',
-        'steps': [
-            'In the left sidebar, open <b>Build</b> (or <b>Databases &amp; Storage</b>).',
-            'Click <b>Storage</b>.',
-            'Click <b>Get started</b>.',
-            'Choose the bucket location <b>US-EAST1</b>. It is close to Vercel\'s Washington servers and '
-            'inside Google\'s no-cost region list (US-CENTRAL1 and US-WEST1 also qualify).',
-            'Click <b>Continue</b>.',
-            'Choose <b>Start in production mode</b>.',
-            'Click <b>Create</b> (or <b>Done</b>).',
-            'Wait for the Files tab to appear.',
-            'At the top of the Files tab you\'ll see a path like <b>gs://pdf-to-slides-4f2a1.firebasestorage.app</b>.',
-            'Write down everything after <b>gs://</b>. That is your <b>bucket name</b>.',
-        ],
-        'note': 'The location cannot be changed later. If you pick the wrong one, create a new project.',
-    },
-    {
-        'title': 'Part 4: Paste the security rules',
-        'intro': 'These rules let a browser upload only a PDF under 50 MB, only into its own folder, and stop '
-                 'anyone reading files through Firebase. The app itself uses the service account (Part 7), '
-                 'which isn\'t bound by these rules.',
-        'steps': [
-            'Still in Storage, click the <b>Rules</b> tab.',
-            'Click inside the editor and select everything (Ctrl+A).',
-            'Press Delete so the editor is empty.',
-            'Copy the rules below. They are also in the repository file <b>storage.rules</b>.',
-            'Paste them into the editor (Ctrl+V).',
-            'Click <b>Publish</b>.',
-            'Check that the "Rules published" message appears.',
-        ],
-        'code': RULES,
-    },
-    {
-        'title': 'Part 5: Enable anonymous sign-in',
-        'intro': 'Each visitor gets an invisible, temporary identity. The rules use it to keep each upload in its '
-                 'owner\'s folder, and the app checks it before touching a file. Visitors never see a login screen.',
-        'steps': [
-            'In the left sidebar, open <b>Build</b> (or <b>Security</b>) and click <b>Authentication</b>.',
-            'Click <b>Get started</b>.',
-            'Open the <b>Sign-in method</b> tab.',
-            'In the list of providers, click <b>Anonymous</b>.',
-            'Switch the <b>Enable</b> toggle on.',
-            'Click <b>Save</b>.',
-            'Check that Anonymous now shows <b>Enabled</b>.',
+            'In the left menu, click <b>Application Keys</b>.',
+            'Find the <b>Master Application Key</b> section at the top.',
+            'Click <b>Generate New Master Application Key</b>.',
+            'Read the warning (it replaces any previous master key) and click <b>Yes!</b> to confirm.',
+            'The page shows a <b>keyID</b> and an <b>applicationKey</b>. The applicationKey is shown only once.',
+            'Copy both into a temporary note. You will delete the note after Part 4.',
         ],
     },
     {
-        'title': 'Part 6: Register the web app and copy its config',
+        'title': 'Part 4: Run the bucket setup script',
+        'intro': 'The script sets a CORS rule (so browsers may upload to the bucket through the app\'s one-time '
+                 'links) and auto-delete rules for the app\'s folders. It uses only built-in Python, so there is '
+                 'nothing to install apart from Python itself.',
         'steps': [
-            'Click <b>Project Overview</b> at the top of the left sidebar.',
-            'Click the web icon <b>&lt;/&gt;</b> (if apps already exist: <b>Add app</b>, then the web icon).',
-            'Type an app nickname, for example <b>pdf-to-slides-web</b>.',
-            'Leave <b>Also set up Firebase Hosting</b> unticked.',
-            'Click <b>Register app</b>.',
-            'A code block appears containing <b>firebaseConfig</b>. Copy these five values into your notes: '
-            '<b>apiKey</b>, <b>authDomain</b>, <b>projectId</b>, <b>storageBucket</b>, <b>appId</b>. '
-            'Copy only the text inside the quotes.',
-            'Ignore messagingSenderId and measurementId. The app doesn\'t need them.',
-            'Click <b>Continue to console</b>.',
+            'Press the <b>Windows key</b>, type <b>cmd</b>, and press Enter to open Command Prompt. '
+            '(Mac: open <b>Terminal</b>.)',
+            'Type <b>python --version</b> and press Enter. (Mac: <b>python3 --version</b>.)',
+            'If you see "Python 3.x", go to step 7.',
+            'If not: open <b>python.org/downloads</b> and click the yellow <b>Download Python</b> button.',
+            'Run the installer. On the first screen, tick <b>Add python.exe to PATH</b>, then click '
+            '<b>Install Now</b>.',
+            'When it finishes, close Command Prompt and open a new one (step 1).',
+            'In your browser, open the repository on GitHub: <b>github.com/ctoriola/pdf.pptx</b>.',
+            'Click the branch dropdown above the file list and choose <b>claude/optimistic-edison-qfmlzo</b> '
+            '(or main, once this work is merged).',
+            'Open the folder <b>scripts</b>, then the file <b>b2_setup.py</b>.',
+            'Click the <b>Download raw file</b> button (the download icon at the top right of the file view).',
+            'In Command Prompt, type <b>cd Downloads</b> and press Enter.',
+            'Type this, with your bucket name in place of YOUR-BUCKET-NAME, then press Enter: '
+            '<font face="Mono">python b2_setup.py --bucket YOUR-BUCKET-NAME</font> (Mac: start with python3).',
+            'At "Master application key ID", paste the master keyID and press Enter.',
+            'At "Master application key", paste the master applicationKey and press Enter. Nothing appears as '
+            'you paste; that is normal.',
+            'Check the result says <b>Bucket "your-bucket" is ready</b>.',
+            'Delete the temporary note with the master key.',
         ],
-        'note': 'These values are public (they end up in every visitor\'s browser), so they\'re safe in Vercel '
-                'settings. To find them again: gear icon > Project settings > General > Your apps.',
+        'note': 'For extra safety you can now generate a new master key (Part 3, steps 1 to 4) without saving it. '
+                'That cancels the one you just used. You only need a master key again to re-run this script.',
     },
     {
-        'title': 'Part 7: Create the service-account key',
-        'intro': 'This key lets the app read uploads and create download links. Treat it like a password.',
+        'title': 'Part 5: Create the app key',
+        'intro': 'This key lets the app read and write files in this one bucket only.',
         'steps': [
-            'Click the gear icon next to Project Overview.',
-            'Click <b>Project settings</b>.',
-            'Open the <b>Service accounts</b> tab.',
-            'Click <b>Generate new private key</b>.',
-            'Click <b>Generate key</b>. A .json file downloads.',
-            'Move the file somewhere private, outside the project folder.',
-            'Never commit it to GitHub, email it, or paste it into a chat.',
+            'Go back to <b>Application Keys</b>.',
+            'Click <b>Add a New Application Key</b>.',
+            'Name of Key: type <b>pdf-to-slides-app</b>.',
+            'Allow access to Bucket(s): choose <b>your bucket</b> (not "All").',
+            'Type of Access: choose <b>Read and Write</b>.',
+            'Leave <b>Allow List All Bucket Names</b> unticked.',
+            'Leave <b>File name prefix</b> and <b>Duration</b> empty.',
+            'Click <b>Create New Key</b>.',
+            'Copy the <b>keyID</b> and the <b>applicationKey</b> straight away. The applicationKey is shown only '
+            'once; if you lose it, delete this key and create another.',
         ],
-        'note': 'If the key ever leaks: Google Cloud console > IAM &amp; Admin > Service accounts > the '
-                'firebase-adminsdk account > Keys > delete it, then generate a new one and update Vercel.',
+        'note': 'Treat the applicationKey like a password: it goes into Vercel only. Never commit it to GitHub, '
+                'email it, or paste it into a chat.',
     },
     {
-        'title': 'Part 8: Auto-delete files after one day',
-        'intro': 'The app deletes each uploaded PDF as soon as the deck is built. This rule removes everything '
-                 'else (finished decks, abandoned uploads) after a day, so the bucket never fills up.',
-        'steps': [
-            'Open <b>console.cloud.google.com</b> (same Google account).',
-            'In the project picker at the top of the page, select your Firebase project.',
-            'Open the menu (three lines, top left) and click <b>Cloud Storage</b>, then <b>Buckets</b>.',
-            'Click your bucket (the bucket name from Part 3).',
-            'Open the <b>Lifecycle</b> tab.',
-            'Click <b>Add a rule</b>.',
-            'Under action, choose <b>Delete object</b>, then click <b>Continue</b>.',
-            'Under conditions, tick <b>Age</b> and enter <b>1</b> (day).',
-            'Click <b>Continue</b>, then <b>Create</b>.',
-            'Check that the rule appears in the Lifecycle list.',
-        ],
-        'note': 'Download links expire after 1 hour anyway; this rule removes the files themselves.',
-    },
-    {
-        'title': 'Part 9: Add the settings to Vercel',
+        'title': 'Part 6: Add the settings to Vercel',
         'steps': [
             'Open <b>vercel.com</b> and select the pdf.pptx project.',
             'Click <b>Settings</b>, then <b>Environment Variables</b>.',
             'For each row of the table below: type the <b>Key</b>, paste the <b>Value</b>, leave all '
-            'environments ticked (Production, Preview, Development), and click <b>Save</b>.',
-            'For FIREBASE_SERVICE_ACCOUNT: open the .json file from Part 7 in Notepad, press Ctrl+A, Ctrl+C, and '
-            'paste the whole contents as the value. Mark it <b>Sensitive</b> if that option is shown.',
-            'Check that all six FIREBASE_ keys are spelled exactly as shown. A missing or misspelled key makes '
-            'the app quietly fall back to 4.4 MB direct uploads.',
+            'environments ticked, and click <b>Save</b>.',
+            'Mark <b>B2_APPLICATION_KEY</b> as <b>Sensitive</b> if that option is shown.',
+            'Check the four keys are spelled exactly as shown. A missing or misspelled key makes the app quietly '
+            'fall back to 4.4 MB direct uploads.',
             'Add <b>GROQ_API_KEY</b> too if you haven\'t already (for Condensed and Detailed slides).',
             'Open the <b>Deployments</b> tab.',
-            'On the latest deployment, click the <b>...</b> menu, then <b>Redeploy</b>, then confirm. '
-            'New settings only reach new deployments.',
+            'On the latest deployment, click the <b>...</b> menu, then <b>Redeploy</b>, then confirm. New settings '
+            'only reach new deployments.',
             'Wait for the deployment to show <b>Ready</b>.',
         ],
         'table': {
             'head': ('Key', 'Value'),
             'rows': [
-                ('FIREBASE_API_KEY', 'apiKey (Part 6)'),
-                ('FIREBASE_AUTH_DOMAIN', 'authDomain (Part 6)'),
-                ('FIREBASE_PROJECT_ID', 'projectId (Part 6)'),
-                ('FIREBASE_STORAGE_BUCKET', 'storageBucket, e.g. xxx.firebasestorage.app, without gs://'),
-                ('FIREBASE_APP_ID', 'appId (Part 6)'),
-                ('FIREBASE_SERVICE_ACCOUNT', 'the entire contents of the .json key file (Part 7)'),
+                ('B2_KEY_ID', 'the app keyID (Part 5)'),
+                ('B2_APPLICATION_KEY', 'the app applicationKey (Part 5)'),
+                ('B2_BUCKET', 'the bucket name (Part 2)'),
+                ('B2_ENDPOINT', 'the endpoint, e.g. s3.us-east-005.backblazeb2.com (Part 2)'),
             ],
         },
     },
     {
-        'title': 'Part 10: Test it',
+        'title': 'Part 7: Test it',
         'steps': [
             'Open your Vercel site.',
-            'Under the upload box, check the hint says <b>Up to 50 MB</b>. If it says 4.4 MB, a FIREBASE_ '
-            'setting is missing: go back to Part 9.',
+            'Under the upload box, check the hint says <b>Up to 100 MB</b>. If it says 4.4 MB, a B2_ setting is '
+            'missing: go back to Part 6.',
             'Choose a PDF larger than 5 MB (any report with images).',
             'Pick <b>Standard</b> and click <b>Convert to slides</b>.',
             'Watch the message count up: "Uploading... 37%".',
             'Wait for the deck to download.',
-            'In the Firebase console, open <b>Storage</b> > <b>Files</b>.',
-            'Check there is an <b>outputs</b> folder with your deck, and that the uploaded PDF is gone from <b>uploads</b>.',
+            'In Backblaze, open <b>Buckets</b>, then <b>Browse Files</b> on your bucket.',
+            'Check there is an <b>outputs</b> folder with your deck, and no PDF left in <b>uploads</b>.',
         ],
     },
 ]
@@ -212,18 +173,21 @@ PARTS = [
 TROUBLE = {
     'head': ('What you see', 'Likely cause and fix'),
     'rows': [
-        ('Hint says "Up to 4.4 MB"', 'One of the six FIREBASE_ settings is missing or misspelled, or you didn\'t '
-                                     'redeploy (Part 9).'),
-        ('"Could not start an upload session"', 'Anonymous sign-in is off (Part 5).'),
-        ('"The upload was refused"', 'Rules not published (Part 4), the file isn\'t a PDF, or it is over 50 MB.'),
-        ('"Your session has expired"', 'FIREBASE_PROJECT_ID doesn\'t match the project. Copy projectId again.'),
-        ('"Something went wrong" right after the upload',
-         'Open Vercel > project > Logs. Usually FIREBASE_SERVICE_ACCOUNT was pasted incompletely, or '
-         'FIREBASE_STORAGE_BUCKET includes gs://.'),
-        ('Download link shows AccessDenied or SignatureDoesNotMatch',
-         'The key belongs to a different project. Generate a new key in this project (Part 7).'),
-        ('The page times out on a very long PDF', 'Vercel stops functions after 300 seconds. Try Standard, or '
-                                                   'split the PDF. MAX_PAGES (default 80) caps the length.'),
+        ('Hint says "Up to 4.4 MB"', 'A B2_ setting is missing or misspelled, or you didn\'t redeploy (Part 6).'),
+        ('"The upload could not reach storage"', 'The CORS rule is missing. Re-run the script (Part 4). Check the '
+                                                 'bucket name you typed matches exactly.'),
+        ('"The upload was refused by storage"', 'B2_KEY_ID or B2_APPLICATION_KEY is wrong, or the key isn\'t '
+                                                'allowed on this bucket. Create a new app key (Part 5).'),
+        ('"Something went wrong" right after the upload', 'Open Vercel > project > Logs. Usually the app key is '
+                                                          'Read Only (it must be Read and Write) or B2_ENDPOINT is '
+                                                          'wrong.'),
+        ('Script says "B2 error (401)"', 'You used the app key, or a typo. The script needs the master key '
+                                         '(Part 3).'),
+        ('Script says "No bucket named ..."', 'The bucket name is misspelled. Copy it from the Buckets page.'),
+        ('"python" is not recognized', 'Python isn\'t installed or wasn\'t added to PATH. Reinstall and tick '
+                                       '"Add python.exe to PATH" (Part 4, step 5).'),
+        ('The page times out on a very long PDF', 'Vercel stops functions after 300 seconds. Try Standard, or split '
+                                                  'the PDF. MAX_PAGES (default 80) caps the length.'),
     ],
 }
 
@@ -233,6 +197,7 @@ TROUBLE = {
 # ============================================================
 def to_md_inline(text):
     text = re.sub(r'</?b>', '**', text)
+    text = re.sub(r'<font face="Mono">(.*?)</font>', r'`\1`', text)
     return text.replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
 
 
@@ -359,6 +324,6 @@ def build_pdf(path):
 
 
 if __name__ == '__main__':
-    (ROOT / 'docs' / 'FIREBASE_SETUP.md').write_text(build_markdown(), encoding='utf-8')
-    build_pdf(ROOT / 'docs' / 'Firebase_Setup_Guide.pdf')
-    print('Wrote docs/FIREBASE_SETUP.md and docs/Firebase_Setup_Guide.pdf')
+    (ROOT / 'docs' / MD_NAME).write_text(build_markdown(), encoding='utf-8')
+    build_pdf(ROOT / 'docs' / PDF_NAME)
+    print(f'Wrote docs/{MD_NAME} and docs/{PDF_NAME}')
