@@ -730,21 +730,142 @@ def extract_stat(item):
     return '', text
 
 
+LEAD_MIN_WORDS, LEAD_MAX_CHARS = 6, 150
+
+
 def split_lead(blocks):
-    """Use the first sentence of the first paragraph as a lead statement."""
+    """
+    Use the first sentence of the first paragraph as a lead statement, but only when it is
+    a real sentence: a fragment such as "Engine oil. Radiator coolant." stays body text.
+    """
     if not blocks or blocks[0]['type'] != 'para':
         return None, blocks
     text = blocks[0]['text']
-    m = re.match(r'^(.{25,150}?[.!?])(\s+|$)(.*)$', text, re.S)
-    if not m:
-        if len(text) <= 150 and blocks[1:]:
-            return text, blocks[1:]
+    parts = re.split(r'(?<=[.!?])\s+', text, maxsplit=1)
+    lead, remainder = parts[0].strip(), (parts[1].strip() if len(parts) > 1 else '')
+    if len(plain(lead).split()) < LEAD_MIN_WORDS or len(lead) > LEAD_MAX_CHARS:
         return None, blocks
-    lead, remainder = m.group(1), m.group(3).strip()
     rest = ([{'type': 'para', 'text': remainder}] if remainder else []) + blocks[1:]
     if not rest:
         return None, blocks  # a single short sentence reads better as body text
     return lead, rest
+
+
+# ============================================================
+# Packing small sections
+# ============================================================
+SMALL_SECTION = 0.5   # a section using less than half a slide may join the one before it
+PACK_FILL = 0.9       # ...if together they fill at most 90% of the slide
+
+
+def section_height(blocks):
+    width = CONTENT_W - 5.6 - GAP if any(b['type'] == 'image' for b in blocks) else CONTENT_W - 4.55
+    images = sum(1 for b in blocks if b['type'] == 'image')
+    if images > SIDE_IMAGES_MAX:
+        return float('inf')  # it needs gallery slides anyway
+    return sum(block_height(b, width) for b in blocks) + 0.45  # + its heading as a sub-heading
+
+
+NUMBERED_RE = re.compile(r'^\s*(\d{1,2})(?:[.)]|\s)\s*\S')
+
+
+def heading_number(title):
+    m = NUMBERED_RE.match(plain(title))
+    return int(m.group(1)) if m else None
+
+
+def can_follow(group_numbers, number):
+    """Numbered lists stay together: 1 may join its intro, n joins n-1, and a list ends the group."""
+    last = group_numbers[-1]
+    if number is None:
+        return all(n is None for n in group_numbers)
+    if number == 1:
+        return last is None
+    return last == number - 1
+
+
+def pack_small_sections(sections):
+    """
+    Short consecutive sections ("01 Defence heritage", "02 Focused range"...) share a slide
+    when they fit: the later section's title becomes a sub-heading under the first.
+    """
+    out, numbers = [], []
+    for name, blocks in sections:
+        number = heading_number(name)
+        if out:
+            prev_name, prev_blocks = out[-1]
+            joined = prev_blocks + [{'type': 'sub', 'text': name}] + list(blocks)
+            if (can_follow(numbers[-1], number) and section_height(blocks) <= CONTENT_H * SMALL_SECTION
+                    and not any(b['type'] == 'table' for b in joined)
+                    and section_height(joined) <= CONTENT_H * PACK_FILL):
+                out[-1] = (prev_name, joined)
+                numbers[-1].append(number)
+                continue
+        out.append((name, list(blocks)))
+        numbers.append([number])
+    return out
+
+
+# ============================================================
+# Splitting long sections
+# ============================================================
+TITLE_MAX_CHARS = 70
+
+
+def block_height(block, width):
+    """Estimated height (inches) of one block at the readable size."""
+    if block['type'] == 'table':
+        return sum(table_row_heights(block['rows'], CONTENT_W, 12)) + 0.3
+    if block['type'] == 'image':
+        return 0.0
+    return text_height([block], width, READABLE_PT)
+
+
+def section_title_from(text):
+    title = plain(text).strip().rstrip('.:;,').strip()
+    return title if 2 <= len(title) <= TITLE_MAX_CHARS else None
+
+
+def split_long_sections(sections):
+    """
+    A section too long for one slide is split at its own sub-headings: sub-heading runs are
+    packed into slide-sized groups, and each later group is titled by the sub-heading it
+    starts with, instead of every slide repeating "<section> (cont.)". Images stay with
+    the text they appeared next to.
+    """
+    out = []
+    for name, blocks in sections:
+        width = CONTENT_W - 5.6 - GAP if any(b['type'] == 'image' for b in blocks) else CONTENT_W - 4.55
+        if sum(block_height(b, width) for b in blocks) <= CONTENT_H:
+            out.append((name, blocks))
+            continue
+        runs, run = [], []
+        for b in blocks:
+            if b['type'] == 'sub' and run:
+                runs.append(run)
+                run = []
+            run.append(b)
+        if run:
+            runs.append(run)
+        if len(runs) < 2:
+            out.append((name, blocks))
+            continue
+        groups, group, height = [], [], 0.0
+        for run in runs:
+            h = sum(block_height(b, width) for b in run)
+            if group and height + h > CONTENT_H:
+                groups.append(group)
+                group, height = [], 0.0
+            group += run
+            height += h
+        groups.append(group)
+        for i, group in enumerate(groups):
+            title = section_title_from(group[0]['text']) if i and group[0]['type'] == 'sub' else None
+            if title and len(group) > 1:
+                out.append((title, group[1:]))
+            else:
+                out.append((name if i == 0 else f'{name} (cont.)', group))
+    return out
 
 
 def section_notes(name, blocks):
@@ -827,6 +948,8 @@ def build_deck(title, sections, theme=DEFAULT_THEME, subtitle='Presentation', on
             builder = DeckBuilder(title, subtitle, one_slide_per_section)
             sections = [(n, b) for n, b in sections if b] or \
                 [('Overview', [{'type': 'para', 'text': 'No content was found in this document.'}])]
+            if not one_slide_per_section:
+                sections = pack_small_sections(split_long_sections(sections))
             builder.cover()
             if agenda and AGENDA_RANGE[0] <= len(sections) <= AGENDA_RANGE[1]:
                 builder.agenda([n for n, _ in sections])

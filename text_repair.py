@@ -17,8 +17,9 @@ log = logging.getLogger(__name__)
 
 # 4+ single characters separated by single spaces: "P R O D U C T"
 LETTER_SPACED_RE = re.compile(r'(?<!\S)(?:[^\s] ){3,}[^\s](?!\S)')
-# a run of 12+ capitals, or 20+ letters of any case, with no space: "BUILTFORASTRONGER"
-GLUED_RE = re.compile(r'[A-Z]{12,}|[A-Za-z]{20,}')
+# a run of 15+ capitals, or 20+ letters of any case, with no space: "BUILTFORASTRONGER"
+# (real single words rarely reach that: SPECIFICATIONS is 14, RESPONSIBILITY 14)
+GLUED_RE = re.compile(r'[A-Z]{15,}|[A-Za-z]{20,}')
 URLISH_RE = re.compile(r'https?://\S+|www\.\S+|\S+@\S+\.\S+')
 
 BATCH_CHARS = 3000

@@ -657,3 +657,65 @@ def test_resized_copies_of_a_picture_are_deduplicated(tmp_path):
     kept = pdf_to_md.filter_images(md, tmp_path)
     assert 'a.png' in kept and 'd.png' in kept  # first copy and a different picture stay
     assert 'b.png' not in kept and 'c.jpg' not in kept  # a large picture repeated is kept once, not dropped
+
+
+# ---------- deck structure: tagline headings, long sections, small sections ----------
+def test_one_off_tagline_heading_does_not_swallow_the_document():
+    md = ('## **DICON-FIPCO**\n\nIntro.\n\n# **BUILT FOR A STRONGER TOMORROW.**\n\nEngine oil.\n\n'
+          '## **WELCOME**\n\nText.\n\n## **WHY DEFENCE**\n\nText.\n\n### **D S O - 1**\n\nText.')
+    out = pdf_to_md.normalize_headings(md)
+    assert '## BUILT FOR A STRONGER TOMORROW.' in out and '## WELCOME' in out and '## WHY DEFENCE' in out
+    assert '### D S O - 1' in out
+
+
+def test_long_section_splits_at_its_subheadings():
+    from deck_builder import split_long_sections, build_deck
+    para = {'type': 'para', 'text': 'Extreme pressure performance protects against metal contact under load. ' * 5}
+    blocks = []
+    for h in ('WELCOME TO DICON-FIPCO.', 'LUBRICANTS FROM NIGERIA', 'WHY DEFENCE NEEDS A TRUSTED OIL SOURCE.',
+              'FIVE GRADES. EVERY ENGINE IN THE FLEET.', 'READING THE API CATEGORY', 'SELECTION AND USE'):
+        blocks += [{'type': 'sub', 'text': h}, para, para]
+    buffer, _ = build_deck('T', [('BUILT FOR A STRONGER TOMORROW.', blocks)])
+    titles = [s.shapes[1].text_frame.text for s in Presentation(buffer).slides
+              if len(s.shapes) > 1 and s.shapes[1].has_text_frame][1:-1]
+    assert sum('(cont.)' in t for t in titles) == 0
+    assert 'FIVE GRADES. EVERY ENGINE IN THE FLEET' in titles  # a later group titled by its sub-heading
+
+
+def test_numbered_items_pack_together_and_lists_end_groups():
+    from deck_builder import pack_small_sections
+    p = lambda: [{'type': 'para', 'text': 'Short line of text here.'}]  # noqa: E731
+    out = pack_small_sections([('Why defence needs a trusted source', p()), ('01 Unverified oil', p()),
+                               ('02 Defence is strategic', p()), ('Five grades', p()), ('Reading the grade', p())])
+    assert [n for n, _ in out] == ['Why defence needs a trusted source', 'Five grades']
+    assert [b['text'] for b in out[0][1] if b['type'] == 'sub'] == ['01 Unverified oil', '02 Defence is strategic']
+
+
+def test_trailing_subheading_moves_to_next_section():
+    from pipeline import move_trailing_subheadings
+    out = move_trailing_subheadings([('Grades', [{'type': 'para', 'text': 'x'}, {'type': 'sub', 'text': 'DSO-1'}]),
+                                     ('Full synthetic engine oil', [{'type': 'para', 'text': 'y'}])])
+    assert out[0][1] == [{'type': 'para', 'text': 'x'}]
+    assert out[1][1][0] == {'type': 'sub', 'text': 'DSO-1'}
+
+
+def test_fragment_is_not_used_as_lead():
+    from deck_builder import split_lead
+    blocks = [{'type': 'para', 'text': 'Engine oil. Radiator coolant. Multi-purpose grease.'},
+              {'type': 'para', 'text': 'More.'}]
+    assert split_lead(blocks) == (None, blocks)
+    lead, rest = split_lead([{'type': 'para', 'text': 'Oil is a small line in any budget and a decisive one. Rest.'}])
+    assert lead == 'Oil is a small line in any budget and a decisive one.'
+
+
+def test_brochure_end_to_end(tmp_path):
+    from pipeline import convert
+    pptx, md, title, slides = convert(FIXTURES / 'brochure.pdf', tmp_path, 'standard', source_name='brochure.pdf')
+    prs = Presentation(str(pptx))
+    text = ' '.join(sh.text_frame.text for s in prs.slides for sh in s.shapes if sh.has_text_frame)
+    assert '<br>' not in text and '<sup>' not in text
+    assert text.count('(cont.)') <= 1
+    assert 'WHY DEFENCE NEEDS A TRUSTED OIL SOURCE' in text
+    picture_slides = [i for i, s in enumerate(prs.slides) if any(sh.shape_type == 13 for sh in s.shapes)]
+    assert len(picture_slides) >= 3  # images sit with their sections, not piled at the end
+    assert len(pictures(prs)) == 3  # the coolant picture appears three times in the PDF, once in the deck

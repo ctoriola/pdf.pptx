@@ -106,8 +106,11 @@ def normalize_headings(markdown, meta_title=''):
     top = min(lvl for _, lvl, _ in heads)
     title_line = heads[0][0] if heads[0][0] == first_content and heads[0][1] == top else None
     section_levels = sorted({lvl for n, lvl, _ in heads if n != title_line})
-
-    out_levels = {lvl: min(6, 2 + i) for i, lvl in enumerate(section_levels)}
+    # Sections use the highest level that occurs at least twice: a one-off giant tagline
+    # ("BUILT FOR A STRONGER TOMORROW.") must not turn every real heading into a sub-heading
+    counts = {lvl: sum(1 for n, l, _ in heads if l == lvl and n != title_line) for lvl in section_levels}
+    section_level = next((lvl for lvl in section_levels if counts[lvl] >= 2), section_levels[0] if section_levels else 1)
+    out_levels = {lvl: 2 if lvl <= section_level else 3 for lvl in section_levels}
     out = list(lines)
     for n, lvl, text in heads:
         out[n] = f'# {text}' if n == title_line else f'{"#" * out_levels[lvl]} {text}'
@@ -184,7 +187,7 @@ def image_hash(path):
     try:
         with Image.open(path) as im:
             g = im.convert('L').resize((9, 8), Image.LANCZOS)
-            px = list(g.getdata())
+            px = list(g.tobytes())
     except (OSError, ValueError):
         return None
     bits = 0

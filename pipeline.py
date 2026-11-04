@@ -31,7 +31,7 @@ def load_sections(md_path):
                 # Never read files outside the job folder, whatever the Markdown says
                 b['path'] = str(p) if base in p.parents and p.is_file() else ''
         blocks[:] = [b for b in blocks if b['type'] != 'image' or b['path']]
-    return title, merge_empty_sections(sections)
+    return title, move_trailing_subheadings(merge_empty_sections(sections))
 
 
 def merge_empty_sections(sections):
@@ -51,6 +51,22 @@ def merge_empty_sections(sections):
         out.append((name, blocks))
     if pending and out:
         out[-1][1].extend({'type': 'sub', 'text': n} for n in pending)
+    return out
+
+
+def move_trailing_subheadings(sections):
+    """
+    A sub-heading with nothing after it (a product name like "DSO-1" set just above the next
+    heading) introduces the next section, so it moves to the start of that section.
+    """
+    out = [(name, list(blocks)) for name, blocks in sections]
+    for i in range(len(out) - 1):
+        name, blocks = out[i]
+        moved = []
+        while len(blocks) > 1 and blocks[-1]['type'] == 'sub':
+            moved.insert(0, blocks.pop())
+        if moved:
+            out[i + 1] = (out[i + 1][0], moved + out[i + 1][1])
     return out
 
 
