@@ -9,7 +9,6 @@ belongs to. Afterwards:
   - junk images (tiny icons, thin rules, blank boxes, repeated logos) are dropped
   - photos are recompressed so the finished deck stays small
 """
-import hashlib
 import logging
 import os
 import re
@@ -24,7 +23,9 @@ log = logging.getLogger(__name__)
 RENDER_DPI = 150            # figure resolution; sharp on a 13.3in slide without bloating the deck
 MIN_IMAGE_PX = 100          # at 150 dpi, ~0.7in; smaller is an icon or bullet glyph
 MAX_ASPECT = 8.0            # wider/taller than this is a rule or banner
-REPEAT_LIMIT = 3            # an identical image on 3+ pages is a logo/header graphic
+REPEAT_LIMIT = 3            # a small picture on 3+ pages is a logo/header graphic
+LOGO_MAX_PX = 400           # at 150 dpi, under ~2.7in: small enough to be a header logo
+DUPLICATE_DISTANCE = 6      # perceptual-hash bits that may differ between copies of one picture
 MAX_IMAGE_PX = 1600         # longest side after recompression
 MAX_PAGES = int(os.environ.get('MAX_PAGES', 80))
 
@@ -137,30 +138,72 @@ def relative_image_refs(markdown, img_dir):
 
 
 def filter_images(markdown, base_dir):
-    """Drop image references that are icons, rules, blank boxes or repeated logos."""
+    """
+    Drop image references that are icons, rules or blank boxes, and repeats of the same
+    picture (matched by perceptual hash, so resized copies count). The first copy of a
+    picture is kept, unless it is a small graphic repeated on many pages (a logo in the
+    page header), in which case every copy goes.
+    """
     lines = markdown.split('\n')
-    refs = []  # (line index, path, digest)
+    refs = []  # (line index, path, hash, longest side)
     for n, line in enumerate(lines):
         m = IMAGE_RE.match(line.strip())
         if m:
             path = resolve(base_dir, m.group('path'))
-            refs.append((n, path, image_digest(path)))
+            refs.append((n, path, image_hash(path), image_side(path)))
 
-    counts = {}
-    for _, _, digest in refs:
-        if digest:
-            counts[digest] = counts.get(digest, 0) + 1
+    clusters = []  # [representative hash, count]
+    cluster_of = {}
+    for n, _, h, _ in refs:
+        if h is None:
+            continue
+        for k, (rep, _) in enumerate(clusters):
+            if hamming(rep, h) <= DUPLICATE_DISTANCE:
+                clusters[k][1] += 1
+                cluster_of[n] = k
+                break
+        else:
+            cluster_of[n] = len(clusters)
+            clusters.append([h, 1])
 
     seen, drop = set(), set()
-    for n, path, digest in refs:
-        keep = digest is not None and counts[digest] < REPEAT_LIMIT and digest not in seen and usable_image(path)
-        if digest:
-            seen.add(digest)
-        if not keep:
+    for n, path, h, side in refs:
+        k = cluster_of.get(n)
+        repeated_logo = k is not None and clusters[k][1] >= REPEAT_LIMIT and side < LOGO_MAX_PX
+        if k is None or k in seen or repeated_logo or not usable_image(path):
             drop.add(n)
+        if k is not None:
+            seen.add(k)
     if drop:
         log.info('Dropped %d of %d extracted images', len(drop), len(refs))
     return '\n'.join(line for n, line in enumerate(lines) if n not in drop)
+
+
+def image_hash(path):
+    """64-bit difference hash: survives resizing and recompression."""
+    try:
+        with Image.open(path) as im:
+            g = im.convert('L').resize((9, 8), Image.LANCZOS)
+            px = list(g.getdata())
+    except (OSError, ValueError):
+        return None
+    bits = 0
+    for row in range(8):
+        for col in range(8):
+            bits = (bits << 1) | (px[row * 9 + col] > px[row * 9 + col + 1])
+    return bits
+
+
+def hamming(a, b):
+    return bin(a ^ b).count('1')
+
+
+def image_side(path):
+    try:
+        with Image.open(path) as im:
+            return max(im.size)
+    except (OSError, ValueError):
+        return 0
 
 
 def optimize_images(markdown, base_dir):
@@ -201,14 +244,6 @@ def shrink_image(path, max_px, quality):
 def resolve(base_dir, ref):
     path = Path(ref)
     return path if path.is_absolute() else Path(base_dir) / path
-
-
-def image_digest(path):
-    try:
-        with Image.open(path) as im:
-            return hashlib.md5(im.convert('L').resize((16, 16)).tobytes()).hexdigest()
-    except (OSError, ValueError):
-        return None
 
 
 def usable_image(path):

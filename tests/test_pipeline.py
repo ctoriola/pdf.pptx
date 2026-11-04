@@ -633,3 +633,27 @@ def test_every_table_in_a_section_is_rendered():
     buffer, _ = build_deck('T', [('Two tables', [{'type': 'para', 'text': 'Intro.'}, t('first'), t('second')])])
     cells = [sh.table.cell(1, 0).text for s in Presentation(buffer).slides for sh in s.shapes if sh.has_table]
     assert cells == ['first', 'second']
+
+
+# ---------- HTML from PyMuPDF and resized duplicate images ----------
+def test_inline_html_becomes_plain_text():
+    from md_parse import clean_inline
+    assert clean_inline('S A E<br>15W-40<BR/>API CI-4 / SL') == 'S A E 15W-40 API CI-4 / SL'
+    assert clean_inline('04<sup>READINESS DEPENDS ON</sup> AVAILABILITY') == '04 READINESS DEPENDS ON AVAILABILITY'
+    assert clean_inline('a <b>bold</b>, ok') == 'a bold, ok'
+    assert clean_inline('Use <email address> here') == 'Use <email address> here'  # not a known tag
+    rows = parse_blocks('| a<br>b | c |\n|---|---|\n| 1 L<br>4 L | x |')[0]['rows']
+    assert rows == [['a b', 'c'], ['1 L 4 L', 'x']]
+
+
+def test_resized_copies_of_a_picture_are_deduplicated(tmp_path):
+    (tmp_path / 'images').mkdir()
+    big = Image.open(FIXTURES / 'images' / 'photo2.png')
+    big.save(tmp_path / 'images' / 'a.png')
+    big.resize((600, 450)).save(tmp_path / 'images' / 'b.png')
+    big.resize((420, 315)).convert('RGB').save(tmp_path / 'images' / 'c.jpg', quality=80)
+    shutil.copy(FIXTURES / 'images' / 'photo3.png', tmp_path / 'images' / 'd.png')
+    md = '\n\n'.join(f'![Image](images/{n})' for n in ('a.png', 'b.png', 'c.jpg', 'd.png'))
+    kept = pdf_to_md.filter_images(md, tmp_path)
+    assert 'a.png' in kept and 'd.png' in kept  # first copy and a different picture stay
+    assert 'b.png' not in kept and 'c.jpg' not in kept  # a large picture repeated is kept once, not dropped

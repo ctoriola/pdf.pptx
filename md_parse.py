@@ -120,9 +120,20 @@ def attach_captions(blocks):
     return out
 
 
+HTML_BREAK_RE = re.compile(r'<br\s*/?>', re.I)
+HTML_TAG_RE = re.compile(r'</?(?:sup|sub|b|i|u|em|strong|span|p|div|font|small|mark)(?:\s[^>]*)?>', re.I)
+
+
 def clean_inline(text):
-    """Undo Markdown escaping that PDF converters add (\\_ \\* \\#) and collapse whitespace."""
-    text = re.sub(r'\\([_*#\[\]()|`>~-])', r'\1', text or '')
+    """
+    Undo Markdown escaping that PDF converters add (\\_ \\* \\#), drop inline HTML they emit
+    (<br> inside table cells, <sup>, <span>), and collapse whitespace.
+    """
+    text = text or ''
+    if '<' in text:
+        text = HTML_TAG_RE.sub(' ', HTML_BREAK_RE.sub(' ', text))
+        text = re.sub(r' +([,.;:!?)])', r'\1', text)
+    text = re.sub(r'\\([_*#\[\]()|`>~-])', r'\1', text)
     return re.sub(r'\s+', ' ', text).strip()
 
 
