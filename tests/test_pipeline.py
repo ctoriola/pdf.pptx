@@ -267,6 +267,7 @@ def test_shrink_pptx_recompresses_pictures(tmp_path):
 # ---------- web app ----------
 @pytest.fixture
 def client(monkeypatch):
+    monkeypatch.delenv('FIREBASE_SERVICE_ACCOUNT', raising=False)
     monkeypatch.delenv('GROQ_API_KEY', raising=False)
     monkeypatch.delenv('LLM_API_KEY', raising=False)
     import app as webapp
@@ -279,7 +280,7 @@ def test_app_converts_pdf(client):
     assert res.status_code == 200, res.data[:300]
     assert res.mimetype.endswith('presentationml.presentation')
     prs = Presentation(__import__('io').BytesIO(res.data))
-    assert len(prs.slides) == int(res.headers['X-Slide-Count'])
+    assert len(prs.slides) == int(res.headers['X-Slides'])
     assert len(pictures(prs)) == 3
 
 
@@ -305,3 +306,92 @@ def test_bold_lines_become_headings():
     out = pdf_to_md.clean_markdown('We combined data. **Regional Gallery**\n\nText.\n\n**Bold sentence.**\n')
     assert '### Regional Gallery' in out and 'We combined data.\n' in out
     assert '**Bold sentence.**' in out  # ends like a sentence, so it stays body text
+
+
+# ---------- Firebase Storage route (Google APIs stubbed) ----------
+class FakeStorage:
+    """Stands in for the bucket: 'uploads' maps paths to local files, 'outputs' records results."""
+    def __init__(self, tmp_path):
+        self.tmp, self.uploads, self.outputs, self.deleted = tmp_path, {}, {}, []
+
+    def download(self, path, dest):
+        if path not in self.uploads:
+            raise storage.StorageError('The uploaded PDF was not found. Please upload it again.')
+        shutil.copy(self.uploads[path], dest)
+
+    def upload_result(self, local, path, name, content_type):
+        self.outputs[path] = Path(local).read_bytes()
+        return f'https://signed.example/{path}'
+
+    def delete(self, path):
+        self.deleted.append(path)
+
+
+@pytest.fixture
+def cloud(monkeypatch, tmp_path):
+    import storage as storage_mod
+    for key in ('FIREBASE_SERVICE_ACCOUNT', 'FIREBASE_STORAGE_BUCKET', 'FIREBASE_PROJECT_ID',
+                'FIREBASE_API_KEY', 'FIREBASE_APP_ID'):
+        monkeypatch.setenv(key, 'x')
+    monkeypatch.delenv('GROQ_API_KEY', raising=False)
+    fake = FakeStorage(tmp_path)
+    monkeypatch.setattr(storage_mod, 'download', fake.download)
+    monkeypatch.setattr(storage_mod, 'upload_result', fake.upload_result)
+    monkeypatch.setattr(storage_mod, 'delete', fake.delete)
+    monkeypatch.setattr(storage_mod, 'verify_user',
+                        lambda h: 'user1' if h == 'Bearer good' else (_ for _ in ()).throw(storage_mod.AuthError('bad')))
+    import app as webapp
+    return webapp.app.test_client(), fake
+
+
+import storage  # noqa: E402
+
+
+def test_cloud_convert_returns_signed_links_and_deletes_pdf(cloud):
+    client, fake = cloud
+    path = 'uploads/user1/abcdef12-3456.pdf'
+    fake.uploads[path] = SAMPLE_PDF
+    res = client.post('/convert', json={'storage_path': path, 'filename': 'report.pdf', 'mode': 'standard'},
+                      headers={'Authorization': 'Bearer good'})
+    assert res.status_code == 200, res.data[:300]
+    data = res.json
+    assert data['download_url'].startswith('https://signed.example/outputs/user1/abcdef12-3456/')
+    assert data['markdown_url'].endswith('_markdown.zip') and data['slides'] >= 5
+    deck = next(v for k, v in fake.outputs.items() if k.endswith('.pptx'))
+    assert len(pictures(Presentation(__import__('io').BytesIO(deck)))) == 3
+    assert fake.deleted == [path]
+
+
+def test_cloud_rejects_other_users_paths_and_bad_tokens(cloud):
+    client, fake = cloud
+    fake.uploads['uploads/user2/abcdef12-3456.pdf'] = SAMPLE_PDF
+    res = client.post('/convert', json={'storage_path': 'uploads/user2/abcdef12-3456.pdf'},
+                      headers={'Authorization': 'Bearer good'})
+    assert res.status_code == 403
+    res = client.post('/convert', json={'storage_path': 'uploads/user1/../../secret.pdf'},
+                      headers={'Authorization': 'Bearer good'})
+    assert res.status_code == 403
+    res = client.post('/convert', json={'storage_path': 'uploads/user1/abcdef12-3456.pdf'},
+                      headers={'Authorization': 'Bearer forged'})
+    assert res.status_code == 401
+    assert fake.outputs == {}
+
+
+def test_cloud_page_includes_firebase_config(cloud):
+    client, _ = cloud
+    html = client.get('/').data.decode()
+    assert 'firebase-storage.js' in html and 'Up to 50 MB' in html
+
+
+def test_page_without_firebase_uses_direct_upload(client):
+    html = client.get('/').data.decode()
+    assert 'firebase' not in html
+
+
+def test_service_account_accepts_raw_or_base64(monkeypatch):
+    import base64 as b64
+    raw = '{"project_id": "p", "type": "service_account"}'
+    monkeypatch.setenv('FIREBASE_SERVICE_ACCOUNT', raw)
+    assert storage._service_account_info()['project_id'] == 'p'
+    monkeypatch.setenv('FIREBASE_SERVICE_ACCOUNT', b64.b64encode(raw.encode()).decode())
+    assert storage._service_account_info()['project_id'] == 'p'

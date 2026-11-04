@@ -2,7 +2,13 @@
 Flask web app: upload a PDF, choose a slide type and theme, download the .pptx.
 
 Stateless, so it runs on serverless hosts (Vercel) as well as a normal server: each
-request converts in its own temporary folder and returns the file directly.
+request converts in its own temporary folder.
+
+Two upload routes:
+  - Firebase Storage (when configured): the browser uploads the PDF to Storage and sends
+    its path; the result comes back as a signed download link. No size limit from Vercel.
+  - Direct: the PDF is posted in the request and the file is returned in the response.
+    On Vercel this is capped at 4.5 MB each way.
 """
 import io
 import logging
@@ -17,6 +23,7 @@ from flask import Flask, jsonify, render_template, request, send_file
 load_dotenv()
 
 import condense  # noqa: E402  (reads LLM settings from the environment loaded above)
+import storage  # noqa: E402
 from deck_builder import DEFAULT_THEME, THEMES, shrink_pptx  # noqa: E402
 from pdf_to_md import PdfConversionError  # noqa: E402
 from slide_plan import DEFAULT_MODE, PLANS, normalize_mode  # noqa: E402
@@ -35,62 +42,122 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = int(MAX_UPLOAD_MB * 1024 * 1024)
 
 
+class InputError(Exception):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
 @app.get('/')
 def index():
+    use_storage = storage.enabled()
     return render_template('index.html', plans=PLANS, default_mode=DEFAULT_MODE, themes=THEMES,
                            default_theme=DEFAULT_THEME, llm_ready=condense.llm_available(),
-                           max_upload_mb=f'{MAX_UPLOAD_MB:g}')
+                           max_upload_mb=f'{storage.MAX_STORAGE_UPLOAD_MB if use_storage else MAX_UPLOAD_MB:g}',
+                           firebase_config=storage.web_config() if use_storage else None)
 
 
-def _read_upload():
-    """Return (pdf bytes, filename) or raise ValueError with a user-facing message."""
-    upload = request.files.get('pdf')
-    if not upload or not upload.filename:
-        raise ValueError('Choose a PDF to upload.')
-    data = upload.read()
-    if not data.startswith(b'%PDF-'):
-        raise ValueError('That file is not a PDF.')
-    return data, upload.filename
+def _options():
+    """Form fields from either a multipart form or a JSON body."""
+    return request.get_json(silent=True) or request.form
+
+
+def _receive_pdf(work):
+    """
+    Put the uploaded PDF at work/input.pdf.
+    Returns (pdf_path, filename, ctx); ctx is None for direct uploads, or a dict with the
+    user's uid, the upload id and storage path for Firebase uploads.
+    """
+    pdf_path = Path(work) / 'input.pdf'
+    opts = _options()
+    if opts.get('storage_path'):
+        if not storage.enabled():
+            raise InputError('Cloud uploads are not configured on this server.')
+        try:
+            uid = storage.verify_user(request.headers.get('Authorization'))
+            upload_id = storage.check_upload_path(opts['storage_path'], uid)
+            storage.download(opts['storage_path'], pdf_path)
+        except storage.AuthError as exc:
+            raise InputError(str(exc), 401)
+        except storage.StorageError as exc:
+            raise InputError(str(exc), 403 if 'belong' in str(exc) else 400)
+        ctx = {'uid': uid, 'id': upload_id, 'path': opts['storage_path']}
+        filename = (opts.get('filename') or 'document.pdf')[:200]
+    else:
+        upload = request.files.get('pdf')
+        if not upload or not upload.filename:
+            raise InputError('Choose a PDF to upload.')
+        upload.save(pdf_path)
+        ctx, filename = None, upload.filename
+    with open(pdf_path, 'rb') as f:
+        if f.read(5) != b'%PDF-':
+            raise InputError('That file is not a PDF.')
+    return pdf_path, filename, ctx
+
+
+def _deliver(local_path, download_name, mimetype, ctx, extra=None):
+    """Signed Storage link (JSON) for cloud uploads; the file itself for direct uploads."""
+    extra = extra or {}
+    if ctx:
+        url = storage.upload_result(local_path, f'outputs/{ctx["uid"]}/{ctx["id"]}/{download_name}',
+                                    download_name, mimetype)
+        return jsonify(download_url=url, filename=download_name, **extra)
+    out = io.BytesIO(Path(local_path).read_bytes())
+    if MAX_RESPONSE_MB and mimetype == PPTX_MIME:
+        out = shrink_pptx(out, int(MAX_RESPONSE_MB * 1024 * 1024))
+    if MAX_RESPONSE_MB and out.getbuffer().nbytes > MAX_RESPONSE_MB * 1024 * 1024:
+        raise InputError('The finished file is too large to download from this server. '
+                         'Try the Condensed slide type, or a PDF with fewer images.', 413)
+    resp = send_file(out, as_attachment=True, download_name=download_name, mimetype=mimetype)
+    for key, value in extra.items():
+        resp.headers[f'X-{key.title()}'] = str(value).encode('ascii', 'ignore').decode()
+    resp.headers['Access-Control-Expose-Headers'] = 'X-Title, X-Slides, Content-Disposition'
+    return resp
 
 
 @app.post('/convert')
 def convert_route():
     from pipeline import convert
 
-    try:
-        data, filename = _read_upload()
-    except ValueError as exc:
-        return jsonify(error=str(exc)), 400
-    mode = normalize_mode(request.form.get('mode'))
+    opts = _options()
+    mode = normalize_mode(opts.get('mode'))
     if PLANS[mode]['uses_llm'] and not condense.llm_available():
         return jsonify(error=f'{PLANS[mode]["label"]} slides need an AI key. Set GROQ_API_KEY on the server, '
                              'or choose Standard.'), 400
-    theme = request.form.get('theme') if request.form.get('theme') in THEMES else DEFAULT_THEME
-    title = (request.form.get('title') or '').strip()[:120] or None
+    theme = opts.get('theme') if opts.get('theme') in THEMES else DEFAULT_THEME
+    title = (opts.get('title') or '').strip()[:120] or None
 
+    ctx = None
     with tempfile.TemporaryDirectory(prefix='pdf2pptx-') as work:
-        pdf_path = Path(work) / 'input.pdf'
-        pdf_path.write_bytes(data)
         try:
-            pptx_path, _, deck_title, slide_total = convert(pdf_path, work, mode, theme, title,
-                                                            source_name=filename)
+            pdf_path, filename, ctx = _receive_pdf(work)
+            pptx_path, md_path, deck_title, slide_total = convert(pdf_path, work, mode, theme, title,
+                                                                  source_name=filename)
+            extra = {'title': deck_title, 'slides': slide_total}
+            if ctx:
+                # The PDF is deleted after this request, so hand back the Markdown link now too
+                zip_path = _zip_markdown(md_path, Path(work) / (pptx_path.stem + '_markdown.zip'))
+                extra['markdown_url'] = storage.upload_result(
+                    zip_path, f'outputs/{ctx["uid"]}/{ctx["id"]}/{zip_path.name}', zip_path.name, 'application/zip')
+            return _deliver(pptx_path, pptx_path.name, PPTX_MIME, ctx, extra)
+        except InputError as exc:
+            return jsonify(error=str(exc)), exc.status
         except (PdfConversionError, condense.LLMError) as exc:
             return jsonify(error=str(exc)), 422
         except Exception:
-            log.exception('Conversion failed for %s', filename)
+            log.exception('Conversion failed')
             return jsonify(error='Something went wrong while converting this PDF.'), 500
-        out = io.BytesIO(pptx_path.read_bytes())
+        finally:
+            if ctx:
+                storage.delete(ctx['path'])  # the PDF is no longer needed
 
-    if MAX_RESPONSE_MB:
-        out = shrink_pptx(out, int(MAX_RESPONSE_MB * 1024 * 1024))
-        if out.getbuffer().nbytes > MAX_RESPONSE_MB * 1024 * 1024:
-            return jsonify(error='The finished deck is too large to download from this server. '
-                                 'Try the Condensed slide type, or a PDF with fewer images.'), 413
-    resp = send_file(out, as_attachment=True, download_name=pptx_path.name, mimetype=PPTX_MIME)
-    resp.headers['X-Deck-Title'] = deck_title.encode('ascii', 'ignore').decode()
-    resp.headers['X-Slide-Count'] = str(slide_total)
-    resp.headers['Access-Control-Expose-Headers'] = 'X-Deck-Title, X-Slide-Count, Content-Disposition'
-    return resp
+
+def _zip_markdown(md_path, zip_path):
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for f in Path(md_path).parent.rglob('*'):
+            if f.is_file():
+                zf.write(f, f.relative_to(Path(md_path).parent))
+    return zip_path
 
 
 @app.post('/markdown')
@@ -98,25 +165,20 @@ def markdown_route():
     """The intermediate Markdown and its images, zipped (no LLM involved)."""
     from pdf_to_md import convert_pdf
 
-    try:
-        data, filename = _read_upload()
-    except ValueError as exc:
-        return jsonify(error=str(exc)), 400
+    ctx = None
     with tempfile.TemporaryDirectory(prefix='pdf2md-') as work:
-        pdf_path = Path(work) / 'input.pdf'
-        pdf_path.write_bytes(data)
         try:
+            pdf_path, filename, ctx = _receive_pdf(work)
             md_path = convert_pdf(pdf_path, Path(work) / 'markdown')
+            zip_path = _zip_markdown(md_path, Path(work) / (Path(filename).stem + '_markdown.zip'))
+            return _deliver(zip_path, zip_path.name, 'application/zip', ctx)
+        except InputError as exc:
+            return jsonify(error=str(exc)), exc.status
         except PdfConversionError as exc:
             return jsonify(error=str(exc)), 422
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for f in md_path.parent.rglob('*'):
-                if f.is_file():
-                    zf.write(f, f.relative_to(md_path.parent))
-    buf.seek(0)
-    return send_file(buf, as_attachment=True, download_name=Path(filename).stem + '_markdown.zip',
-                     mimetype='application/zip')
+        finally:
+            if ctx:
+                storage.delete(ctx['path'])
 
 
 @app.errorhandler(413)

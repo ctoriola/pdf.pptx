@@ -240,30 +240,70 @@ form button[type=submit] { margin-top: 28px; width: 100%; }
     }
   }
 
+  let markdownUrl = null;
+
+  function triggerDownload(url) {
+    const a = document.createElement('a');
+    a.href = url;
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+
+  // Cloud route: upload to Firebase Storage, then send only the file's path
+  async function convertViaCloud(file, mode, usesLlm) {
+    show('running', 'Uploading… 0%', 'Keep this tab open.');
+    const { path, token } = await window.cloudUpload(file, pct => show('running', `Uploading… ${pct}%`, 'Keep this tab open.'));
+    startTicker(usesLlm);
+    const body = Object.fromEntries(lastForm.entries());
+    delete body.pdf;
+    Object.assign(body, { storage_path: path, filename: file.name });
+    const res = await fetch('/convert', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) return show('error', await errorText(res));
+    const data = await res.json();
+    triggerDownload(data.download_url);
+    dlPptx.href = data.download_url; dlPptx.removeAttribute('download');
+    markdownUrl = data.markdown_url || null;
+    show('done', 'Your slides are ready and downloading.', `${data.title} · ${data.slides} slides · links work for 1 hour`);
+    result.hidden = false;
+  }
+
+  // Direct route: the PDF goes in the request and the deck comes back in the response
+  async function convertDirect(usesLlm) {
+    startTicker(usesLlm);
+    const res = await fetch('/convert', { method: 'POST', body: lastForm });
+    if (!res.ok) return show('error', await errorText(res));
+    const name = filenameFrom(res, 'slides.pptx');
+    const url = saveBlob(await res.blob(), name);
+    dlPptx.href = url; dlPptx.download = name;
+    markdownUrl = null;
+    show('done', 'Your slides are ready and downloading.',
+         `${res.headers.get('X-Title') || name} · ${res.headers.get('X-Slides') || '?'} slides`);
+    result.hidden = false;
+  }
+
   form.addEventListener('submit', async ev => {
     ev.preventDefault();
     const file = input.files[0];
     if (file && file.size > MAX_MB * 1024 * 1024) return show('error', `That PDF is larger than ${MAX_MB} MB.`);
     lastForm = new FormData(form);
     const mode = form.querySelector('input[name=mode]:checked');
+    const usesLlm = !!(mode && mode.closest('.mode').querySelector('.tag'));
     form.hidden = true;
     result.hidden = true;
-    startTicker(mode && mode.closest('.mode').querySelector('.tag'));
     try {
-      const res = await fetch('/convert', { method: 'POST', body: lastForm });
-      if (!res.ok) return show('error', await errorText(res));
-      const name = filenameFrom(res, 'slides.pptx');
-      const url = saveBlob(await res.blob(), name);
-      dlPptx.href = url; dlPptx.download = name;
-      show('done', 'Your slides are ready and downloading.',
-           `${res.headers.get('X-Deck-Title') || name} · ${res.headers.get('X-Slide-Count') || '?'} slides`);
-      result.hidden = false;
+      if (window.cloudUpload) await convertViaCloud(file, mode, usesLlm);
+      else await convertDirect(usesLlm);
     } catch (err) {
-      show('error', 'Could not reach the server.');
+      console.error(err);
+      show('error', err && err.userMessage ? err.userMessage : 'Could not reach the server.');
     }
   });
 
   dlMd.addEventListener('click', async () => {
+    if (markdownUrl) return triggerDownload(markdownUrl);
     if (!lastForm) return;
     dlMd.disabled = true; dlMd.textContent = 'Preparing…';
     try {
@@ -281,5 +321,43 @@ form button[type=submit] { margin-top: 28px; width: 100%; }
   });
 })();
 </script>
+{% if firebase_config %}
+<script type="module">
+  // Firebase Storage upload: anonymous sign-in, then uploads/<uid>/<random id>.pdf
+  import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+  import { getAuth, signInAnonymously } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
+  import { getStorage, ref, uploadBytesResumable } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js';
+
+  const fb = initializeApp({{ firebase_config | tojson }});
+  const auth = getAuth(fb);
+  const store = getStorage(fb);
+
+  function fail(message, err) {
+    console.error(err);
+    const e = new Error(message); e.userMessage = message; return e;
+  }
+
+  window.cloudUpload = async (file, onProgress) => {
+    let user;
+    try {
+      user = auth.currentUser || (await signInAnonymously(auth)).user;
+    } catch (err) {
+      throw fail('Could not start an upload session. Check that Anonymous sign-in is enabled in Firebase.', err);
+    }
+    const id = crypto.randomUUID();
+    const path = `uploads/${user.uid}/${id}.pdf`;
+    await new Promise((resolve, reject) => {
+      const task = uploadBytesResumable(ref(store, path), file, { contentType: 'application/pdf' });
+      task.on('state_changed',
+        snap => onProgress(Math.round(100 * snap.bytesTransferred / Math.max(snap.totalBytes, 1))),
+        err => reject(fail(err.code === 'storage/unauthorized'
+          ? 'The upload was refused. Only PDFs within the size limit can be uploaded.'
+          : 'The upload failed. Check your connection and try again.', err)),
+        resolve);
+    });
+    return { path, token: await user.getIdToken() };
+  };
+</script>
+{% endif %}
 </body>
 </html>

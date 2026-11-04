@@ -57,27 +57,42 @@ token limits, and HTTP 429 responses are retried using the `Retry-After` header.
 
 The app is stateless: each request converts in a temporary folder and returns the file, so it
 runs as a single Vercel Python function. Vercel detects Flask from `app.py`, and `.python-version`
-pins Python 3.12. The installed dependencies take about 330 MB, under the 500 MB function limit.
+pins Python 3.12. The installed dependencies take about 370 MB, under the 500 MB function limit.
 
 1. Import the repo in Vercel. No build settings are needed.
 2. Add `GROQ_API_KEY` under Project → Settings → Environment Variables.
 
-Vercel limits to know about:
+### Large PDFs: Firebase Storage
+
+Vercel functions accept and return at most 4.5 MB. When Firebase Storage is configured, the
+browser uploads the PDF straight to Storage (up to 50 MB), the function gets only the file's path,
+and the deck comes back as a signed link that expires after 1 hour. **Setup guide:
+[`docs/Firebase_Setup_Guide.pdf`](docs/Firebase_Setup_Guide.pdf)**
+(also as [`docs/FIREBASE_SETUP.md`](docs/FIREBASE_SETUP.md)).
+
+| Piece | File |
+|---|---|
+| Server: token check, download, upload, signed links | `storage.py` |
+| Browser: anonymous sign-in + resumable upload | bottom of `templates/index.html` |
+| Upload rules (PDF only, <50 MB, own folder only) | `storage.rules` |
+| Auto-delete after 1 day | `lifecycle.json` (or the console steps in the guide) |
+
+Without the six `FIREBASE_*` variables the app falls back to direct uploads:
 
 | Limit | Effect | How the app handles it |
 |---|---|---|
 | 4.5 MB request body | PDFs over ~4.4 MB can't be uploaded | Checked in the browser and on the server, with a clear message |
 | 4.5 MB response body | Image-heavy decks could exceed it | The pictures inside the .pptx are recompressed in steps until it fits |
-| Function duration (300 s default) | Long PDFs in Condensed/Detailed make one LLM call per section | `MAX_PAGES` (default 80) caps the input |
 
-Lifting the upload limit would mean uploading straight to Vercel Blob from the browser, or hosting
-somewhere else (Render, Railway, Fly.io), where `MAX_UPLOAD_MB` defaults to 50 MB:
+Either way, the function stops after 300 seconds, so `MAX_PAGES` (default 80) caps the input.
+
+On other hosts (Render, Railway, Fly.io) direct uploads default to 50 MB:
 
 ```bash
 gunicorn -w 2 --timeout 300 -b 0.0.0.0:8000 app:app
 ```
 
-Settings: `MAX_UPLOAD_MB`, `MAX_RESPONSE_MB` (0 = no limit), `MAX_PAGES`.
+Settings: `MAX_UPLOAD_MB`, `MAX_RESPONSE_MB` (0 = no limit), `MAX_STORAGE_UPLOAD_MB`, `MAX_PAGES`.
 
 Scanned PDFs (no text layer) are rejected with a message suggesting OCR first. Tesseract isn't
 available on Vercel.
