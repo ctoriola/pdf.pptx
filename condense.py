@@ -111,7 +111,7 @@ Section(s): {heading}
 Summarise the text below into ONE slide.
 Return JSON: {{"title": "...", "body": "..."}}
 - "title": a slide title of at most 8 words.
-- "body": Markdown. One short framing sentence, then 3 to 5 bullet points ("- ").
+- "body": Markdown. One short framing sentence, then 3 short bullet points ("- ") of a few words each.
   At most {words} words in total. Keep the most important numbers. Bold (**like this**) at most one key phrase per bullet.
   No headings, no tables, no images.
 

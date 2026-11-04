@@ -678,12 +678,15 @@ def test_long_section_splits_at_its_subheadings():
     buffer, _ = build_deck('T', [('BUILT FOR A STRONGER TOMORROW.', blocks)])
     titles = [s.shapes[1].text_frame.text for s in Presentation(buffer).slides
               if len(s.shapes) > 1 and s.shapes[1].has_text_frame][1:-1]
-    assert sum('(cont.)' in t for t in titles) == 0
-    assert 'FIVE GRADES. EVERY ENGINE IN THE FLEET' in titles  # a later group titled by its sub-heading
+    assert sum(t.startswith('BUILT FOR A STRONGER TOMORROW. (cont.)') for t in titles) <= 1  # only its own overflow
+    for heading in ('LUBRICANTS FROM NIGERIA', 'FIVE GRADES. EVERY ENGINE IN THE FLEET', 'SELECTION AND USE'):
+        assert heading in titles  # each later group is titled by its own sub-heading
 
 
-def test_numbered_items_pack_together_and_lists_end_groups():
+def test_numbered_items_pack_together_and_lists_end_groups(monkeypatch):
+    import deck_builder
     from deck_builder import pack_small_sections
+    monkeypatch.setattr(deck_builder, 'TEXT_BUDGET', deck_builder.CONTENT_H)  # test the grouping rules alone
     p = lambda: [{'type': 'para', 'text': 'Short line of text here.'}]  # noqa: E731
     out = pack_small_sections([('Why defence needs a trusted source', p()), ('01 Unverified oil', p()),
                                ('02 Defence is strategic', p()), ('Five grades', p()), ('Reading the grade', p())])
@@ -719,3 +722,19 @@ def test_brochure_end_to_end(tmp_path):
     picture_slides = [i for i, s in enumerate(prs.slides) if any(sh.shape_type == 13 for sh in s.shapes)]
     assert len(picture_slides) >= 3  # images sit with their sections, not piled at the end
     assert len(pictures(prs)) == 3  # the coolant picture appears three times in the PDF, once in the deck
+
+
+def test_text_per_slide_is_halved():
+    """A section that would fill one slide edge to edge now spreads over two, in larger type."""
+    from deck_builder import CONTENT_H, CONTENT_W, READABLE_PT, TEXT_BUDGET, build_deck, text_height
+    sentence = 'Extreme pressure performance protects against metal contact under heavy load and shock. '
+    para = {'type': 'para', 'text': sentence * 3}
+    blocks = []
+    while text_height(blocks + [para], CONTENT_W, READABLE_PT) <= CONTENT_H * 0.95:
+        blocks.append(dict(para))
+    assert text_height(blocks, CONTENT_W, READABLE_PT) > TEXT_BUDGET
+    buffer, slides = build_deck('T', [('Full slide of text', blocks)])
+    assert slides >= 4  # cover, at least two content slides, closing
+    sizes = {r.font.size.pt for s in Presentation(buffer).slides for sh in s.shapes if sh.has_text_frame
+             for p in sh.text_frame.paragraphs for r in p.runs if r.text.startswith('Extreme')}
+    assert min(sizes) >= READABLE_PT

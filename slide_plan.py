@@ -15,7 +15,7 @@ PLANS = {
         'description': 'AI-summarised. Key points only, one slide per topic.',
         'uses_llm': True,
         'one_slide_per_section': True,
-        'words': 70,            # word budget per slide given to the LLM
+        'words': 35,            # word budget per slide given to the LLM
         'max_sections': 12,     # adjacent sections are grouped down to this many slides
         'agenda': True,
     },
@@ -33,7 +33,7 @@ PLANS = {
         'description': 'AI-expanded. Each section explained in more depth with context and takeaways.',
         'uses_llm': True,
         'one_slide_per_section': False,
-        'words': 220,           # target words per section after expansion
+        'words': 220,           # target words per section after expansion (spread over several slides)
         'max_sections': None,
         'agenda': True,
     },

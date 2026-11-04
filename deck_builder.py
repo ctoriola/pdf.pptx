@@ -69,8 +69,23 @@ CONTENT_W = SLIDE_W - 2 * MARGIN
 GAP = 0.35
 CAPTION_H = 0.5
 
-MAX_BODY_PT, MIN_BODY_PT = 18, 12
+MAX_BODY_PT, MIN_BODY_PT = 24, 12
 READABLE_PT = 16  # below this, continue on another slide instead
+# Each slide carries at most this share of a full content area of text (measured at
+# READABLE_PT); the text is then set as large as the box allows, up to MAX_BODY_PT.
+# 0.5 = half the text a slide could physically hold, which presents far better.
+TEXT_FILL = 0.5
+TEXT_BUDGET = CONTENT_H * TEXT_FILL
+
+
+def fits_budget(blocks, width):
+    return text_height(blocks, width, READABLE_PT) <= TEXT_BUDGET
+
+
+def page_size(pages, width, height=CONTENT_H):
+    """One font size for a run of slides: the largest at which every page fills its box."""
+    sizes = [fit_size(p, width, height, READABLE_PT) or READABLE_PT for p in pages if p]
+    return min(sizes) if sizes else MAX_BODY_PT
 GALLERY_MAX = 4   # images per gallery slide
 SIDE_IMAGES_MAX = 2
 NUMBER_RE = re.compile(r'(?<![\w.])([$€£₦]?\d[\d,.]*\s?(?:%|[xX]\b|[KkMmBbTt]\b|bn\b|million\b|billion\b)?\+?)')
@@ -434,16 +449,15 @@ class DeckBuilder:
             size = (fit_size(rest, body_w, height) or MIN_BODY_PT) if rest else MAX_BODY_PT
             pages = [rest]
         else:
-            size = fit_size(rest, body_w, height, READABLE_PT) if rest else MAX_BODY_PT
-            pages = [rest] if size else split_blocks(rest, body_w, height)
-        if not self.one_slide_per_section and len(pages) == 2 and \
-                text_height(pages[1], body_w, READABLE_PT) < height * 0.3:
-            tighter = fit_size(rest, body_w, height, READABLE_PT - 1)  # avoid a near-empty continuation
-            if tighter:
-                size, pages = tighter, [rest]
-        if len(pages) > 1 and lead:
-            # Continuation slides have no lead box, so re-flow them at full width
-            pages = pages[:1] + split_blocks([b for pg in pages[1:] for b in pg], CONTENT_W, height)
+            pages = [rest] if fits_budget(rest, body_w) else split_blocks(rest, body_w, TEXT_BUDGET)
+            if len(pages) == 2 and text_height(pages[1], body_w, READABLE_PT) < TEXT_BUDGET * 0.3 \
+                    and text_height(rest, body_w, READABLE_PT) <= TEXT_BUDGET * 1.2:
+                pages = [rest]  # avoid a near-empty continuation slide
+            if len(pages) > 1 and lead:
+                # Continuation slides have no lead box, so re-flow them at full width
+                pages = pages[:1] + split_blocks([b for pg in pages[1:] for b in pg], CONTENT_W, TEXT_BUDGET)
+            size = page_size(pages[:1], body_w) if len(pages) == 1 else \
+                min(page_size(pages[:1], body_w), page_size(pages[1:], CONTENT_W))
         for n, page in enumerate(pages):
             slide = self._new_slide(notes)
             self._chrome(slide, number, name if n == 0 else f'{name} (cont.)')
@@ -468,7 +482,7 @@ class DeckBuilder:
         if len(images) < 2 or any(is_portrait(i['path']) for i in images):
             return False
         text_w = CONTENT_W - self._side_width(images) - GAP
-        return fit_size(text, text_w, CONTENT_H, READABLE_PT) is not None
+        return fits_budget(text, text_w)
 
     def _text_image_slides(self, number, name, text, images, notes):
         """Text on the left, image(s) on the right; overflowing text continues at full width."""
@@ -479,10 +493,12 @@ class DeckBuilder:
             size = fit_size(text, text_w, CONTENT_H) or MIN_BODY_PT
             pages = [text]
         else:
-            size = fit_size(text, text_w, CONTENT_H, READABLE_PT)
-            pages = [text] if size else split_blocks(text, text_w, CONTENT_H)
+            pages = [text] if fits_budget(text, text_w) else split_blocks(text, text_w, TEXT_BUDGET)
             if len(pages) > 1:
-                pages = pages[:1] + split_blocks([b for pg in pages[1:] for b in pg], CONTENT_W, CONTENT_H)
+                pages = pages[:1] + split_blocks([b for pg in pages[1:] for b in pg], CONTENT_W, TEXT_BUDGET)
+                size = min(page_size(pages[:1], text_w), page_size(pages[1:], CONTENT_W))
+            else:
+                size = page_size(pages, text_w)
         for n, page in enumerate(pages):
             slide = self._new_slide(notes)
             self._chrome(slide, number, name if n == 0 else f'{name} (cont.)')
@@ -585,7 +601,7 @@ class DeckBuilder:
         side_w = 4.3
         table_w = CONTENT_W - side_w - 0.5
         if len(tables) == 1 and others:
-            side_size = fit_size(others, side_w, CONTENT_H, READABLE_PT - 2)
+            side_size = fits_budget(others, side_w) and fit_size(others, side_w, CONTENT_H, READABLE_PT - 2)
             fit = table_fit(tables[0]['rows'], table_w, CONTENT_H)
             if side_size and fit:
                 slide = self._new_slide(notes)
@@ -754,8 +770,8 @@ def split_lead(blocks):
 # ============================================================
 # Packing small sections
 # ============================================================
-SMALL_SECTION = 0.5   # a section using less than half a slide may join the one before it
-PACK_FILL = 0.9       # ...if together they fill at most 90% of the slide
+SMALL_SECTION = 0.75  # a section using under 75% of a slide's text budget may join the one before it
+PACK_FILL = 1.0       # ...if together they stay within one slide's text budget
 
 
 def section_height(blocks):
@@ -795,9 +811,9 @@ def pack_small_sections(sections):
         if out:
             prev_name, prev_blocks = out[-1]
             joined = prev_blocks + [{'type': 'sub', 'text': name}] + list(blocks)
-            if (can_follow(numbers[-1], number) and section_height(blocks) <= CONTENT_H * SMALL_SECTION
+            if (can_follow(numbers[-1], number) and section_height(blocks) <= TEXT_BUDGET * SMALL_SECTION
                     and not any(b['type'] == 'table' for b in joined)
-                    and section_height(joined) <= CONTENT_H * PACK_FILL):
+                    and section_height(joined) <= TEXT_BUDGET * PACK_FILL):
                 out[-1] = (prev_name, joined)
                 numbers[-1].append(number)
                 continue
@@ -836,7 +852,7 @@ def split_long_sections(sections):
     out = []
     for name, blocks in sections:
         width = CONTENT_W - 5.6 - GAP if any(b['type'] == 'image' for b in blocks) else CONTENT_W - 4.55
-        if sum(block_height(b, width) for b in blocks) <= CONTENT_H:
+        if sum(block_height(b, width) for b in blocks) <= TEXT_BUDGET:
             out.append((name, blocks))
             continue
         runs, run = [], []
@@ -853,7 +869,7 @@ def split_long_sections(sections):
         groups, group, height = [], [], 0.0
         for run in runs:
             h = sum(block_height(b, width) for b in run)
-            if group and height + h > CONTENT_H:
+            if group and height + h > TEXT_BUDGET:
                 groups.append(group)
                 group, height = [], 0.0
             group += run

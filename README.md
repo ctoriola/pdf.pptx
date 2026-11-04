@@ -23,11 +23,13 @@ PDF ──PyMuPDF──▶ Markdown + images ──parse──▶ sections ─�
 | 4. Slide plan | `slide_plan.py` | The three slide types and their word budgets. |
 | 5. Deck | `deck_builder.py` | Picks a layout per section (table, stat cards, numbered cards, lead + body, text + image, image gallery), sizes text to fit, and continues long sections on "(cont.)" slides. Three themes. |
 
+Each slide carries at most half the text it could physically hold (`TEXT_FILL = 0.5` in `deck_builder.py`), set as large as the box allows up to 24pt, so slides stay presentable rather than reading like pages. Long sections split at their own sub-headings; short ones share a slide, keeping numbered lists together.
+
 ## Slide types
 
 | Type | Text source | Slides |
 |---|---|---|
-| **Condensed** | LLM summary, ≤70 words per slide | Adjacent sections grouped into at most 12 slides; up to 2 images each (the largest). |
+| **Condensed** | LLM summary, ≤35 words per slide (a framing sentence and 3 short bullets) | Adjacent sections grouped into at most 12 slides; up to 2 images each (the largest). |
 | **Standard** | The full text from the PDF, no LLM | One section → as many slides as it needs; every image kept. |
 | **Detailed** | LLM expansion (explanations, definitions, key takeaways) | Like Standard, with original tables and images re-attached. |
 
