@@ -18,7 +18,7 @@ MAX_CHAPTER_PAGE_SHARE = 0.5
 PICTURE_TEXT_RE = re.compile(
     r'<!--\s*Start of picture text\s*-->.*?<!--\s*End of picture text\s*-->'
     r'|\*\*-{3,}\s*Start of picture text\s*-{3,}\*\*.*?\*\*-{3,}\s*End of picture text\s*-{3,}\*\*', re.S | re.I)
-TOC_HEADING_RE = re.compile(r'^\W*(table\W*of\W*)?contents\W*$', re.I)
+TOC_HEADING_RE = re.compile(r'^\W*(table\W*(of\W*)?)?contents\W*$', re.I)
 TOC_LINE_RE = re.compile(r'(\.\s?){3,}\s*\d{1,4}\s*\**\s*$|\s[–—-]\s*\d{1,4}\s*$')
 LEGAL_RE = re.compile(r'all rights reserved|copyright\s*(©|\(c\))|©\s*(19|20)\d\d|no part of this (publication|book)', re.I)
 HEADING_RE = re.compile(r'^(#{1,6})\s+(.*?)\s*#*\s*$')
@@ -60,6 +60,14 @@ def page_lines(page):
     return sorted(out, key=lambda item: item[2])
 
 
+def _join_lines(parts):
+    """Join the lines of a heading; a line ending in a hyphen continues without a space."""
+    text = ''
+    for part in parts:
+        text += part if text.endswith('-') else (' ' + part if text else part)
+    return re.sub(r'\s+', ' ', text).strip()
+
+
 def analyze(doc):
     """
     Returns {'body_size', 'chapters': {page index: title}, 'cover_title', 'acronyms'}.
@@ -82,6 +90,27 @@ def analyze(doc):
     def display(text, size):
         return size >= body * DISPLAY_RATIO and len(re.findall(r'[A-Za-z]', text)) >= 3
 
+    def runs_at(lines, chapter_size):
+        """Runs of adjacent lines at the chapter size on one page, each with any subtitle under it."""
+        runs, last_y = [], None
+        for text, size, y in lines:
+            if not re.search(r'[A-Za-z]{2}', text):
+                continue
+            near = last_y is not None and 0 <= y - last_y <= chapter_size * 1.6
+            if display(text, size) and abs(size - chapter_size) <= chapter_size * 0.15:
+                if near:
+                    runs[-1].append(text)
+                else:
+                    runs.append([text])
+                last_y = y
+            elif near and chapter_size * 0.6 <= size < chapter_size * 0.85:
+                runs[-1].append(text)  # a subtitle set just under the title: "(1 TO PUBERTY)"
+                last_y = y
+        return runs
+
+    # The chapter size: the display size found on the most pages (at least two, at most half),
+    # used for exactly one heading on each of them. A size that heads several blocks on one page
+    # is a section heading, and one-off cover lettering never recurs.
     pages_by_size = defaultdict(set)
     for n, lines in enumerate(per_page):
         for text, size, _ in lines:
@@ -89,20 +118,13 @@ def analyze(doc):
                 pages_by_size[round(size)].add(n)
     chapters = {}
     candidates = [(len(pages), size) for size, pages in pages_by_size.items()
-                  if 2 <= len(pages) <= max(2, len(per_page) * MAX_CHAPTER_PAGE_SHARE)]
+                  if 2 <= len(pages) <= max(2, len(per_page) * MAX_CHAPTER_PAGE_SHARE)
+                  and all(len(runs_at(per_page[n], size)) == 1 for n in pages)]
     if candidates:
         _, chapter_size = max(candidates)
         for n, lines in enumerate(per_page):
-            parts, last_y = [], None
-            for text, size, y in lines:
-                if display(text, size) and abs(size - chapter_size) <= chapter_size * 0.15:
-                    parts.append(text)
-                    last_y = y
-                elif last_y is not None and 0 < y - last_y <= chapter_size * 1.6 \
-                        and chapter_size * 0.6 <= size < chapter_size * 0.85 and re.search(r'[A-Za-z]{2}', text):
-                    parts.append(text)  # a subtitle line set just under the title: "(1 TO PUBERTY)"
-                    last_y = y
-            title = re.sub(r'\s+', ' ', ' '.join(parts)).strip()
+            runs = runs_at(lines, chapter_size)
+            title = _join_lines(runs[0]) if len(runs) == 1 else ''
             if 3 <= len(title) <= 120 and not TOC_HEADING_RE.match(title):
                 chapters[n] = title
 
@@ -112,15 +134,22 @@ def analyze(doc):
     if per_page and per_page[0]:
         biggest = max(size for _, size, _ in per_page[0])
         if biggest >= body * 1.5:
-            threshold, parts = max(biggest * 0.45, body * 1.5), []
-            for text, size, _ in per_page[0]:
-                if size >= threshold and re.search(r'[A-Za-z]{2}', text):
+            threshold, parts, last_y = max(biggest * 0.45, body * 1.5), [], None
+            for text, size, y in per_page[0]:
+                if size >= threshold and re.search(r'[A-Za-z]{2}', text) \
+                        and (last_y is None or y - last_y <= size * 2.2):
                     parts.append(text)
+                    last_y = y
                 elif parts and len(text) > 3:
                     break
-            cover_title = re.sub(r'\s+', ' ', ' '.join(dict.fromkeys(parts))).strip()
+            cover_title = _join_lines(list(dict.fromkeys(parts)))
             if not 3 <= len(cover_title) <= 100:
                 cover_title = ''
+    # The cover and a title page repeating it are not chapters
+    cover_words = set(_words(cover_title))
+    for n in [k for k in chapters if k <= 2]:
+        if n == 0 or (cover_words and set(_words(chapters[n])) <= cover_words):
+            del chapters[n]
     acronyms = {w for w, c in caps_words.items() if c >= 2}
     return {'body_size': body, 'chapters': chapters, 'cover_title': cover_title, 'acronyms': acronyms}
 

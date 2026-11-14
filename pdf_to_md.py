@@ -26,6 +26,7 @@ MIN_IMAGE_PX = 100          # at 150 dpi, ~0.7in; smaller is an icon or bullet g
 MAX_ASPECT = 8.0            # wider/taller than this is a rule or banner
 REPEAT_LIMIT = 3            # a small picture on 3+ pages is a logo/header graphic
 LOGO_MAX_PX = 400           # at 150 dpi, under ~2.7in: small enough to be a header logo
+BANNER_ASPECT = 2.5         # this much wider than tall (or taller than wide) reads as a banner
 DUPLICATE_DISTANCE = 6      # perceptual-hash bits that may differ between copies of one picture
 MAX_IMAGE_PX = 1600         # longest side after recompression
 MAX_PAGES = int(os.environ.get('MAX_PAGES', 80))
@@ -160,7 +161,9 @@ def normalize_headings(markdown, title='', acronyms=()):
 def _good_title(title):
     title = (title or '').strip()
     # Skip generator defaults such as "untitled", "Microsoft Word - doc1.docx", "report.pdf"
-    return (4 <= len(title) <= 150 and not re.search(r'\.(docx?|pdf|pptx?|indd)$|^untitled|^microsoft', title, re.I))
+    return (4 <= len(title) <= 150
+            and not re.search(r'\.(docx?|pdf|pptx?|indd)$|^untitled|^microsoft|^\(?anonymous\)?$|^document\d*$',
+                              title, re.I))
 
 
 # ============================================================
@@ -209,7 +212,9 @@ def filter_images(markdown, base_dir):
     seen, drop = set(), set()
     for n, path, h, side in refs:
         k = cluster_of.get(n)
-        repeated_logo = k is not None and clusters[k][1] >= REPEAT_LIMIT and side < LOGO_MAX_PX
+        # Repeated on 3+ pages and small or banner-shaped: a logo or a running header drawn as art
+        repeated_logo = k is not None and clusters[k][1] >= REPEAT_LIMIT \
+            and (side < LOGO_MAX_PX or image_aspect(path) >= BANNER_ASPECT)
         if k is None or k in seen or repeated_logo or not usable_image(path):
             drop.add(n)
         if k is not None:
@@ -236,6 +241,14 @@ def image_hash(path):
 
 def hamming(a, b):
     return bin(a ^ b).count('1')
+
+
+def image_aspect(path):
+    try:
+        with Image.open(path) as im:
+            return max(im.size) / max(1, min(im.size))
+    except (OSError, ValueError):
+        return 1.0
 
 
 def image_side(path):

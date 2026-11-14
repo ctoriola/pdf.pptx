@@ -87,6 +87,8 @@ def build_from_markdown(md_path, mode='standard', theme='coral', title=None, pdf
     # Letter-spaced / run-together words from the PDF ("P R O D U C T", "BUILTFORASTRONGER")
     md_title, sections = text_repair.repair_sections(md_title, sections, progress)
     title = deck_title(md_title, pdf_path, title)
+    if len(sections) == 1 and sections[0][0] == 'Overview':
+        sections = [(title, sections[0][1])]  # a document with no headings: its slides carry its title
     log.info('%s: %d sections, %d words', title, len(sections), sum(word_count(b) for _, b in sections))
 
     if plan['mode'] == 'condensed':

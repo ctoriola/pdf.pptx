@@ -852,3 +852,40 @@ def test_long_documents_use_fuller_slides():
     half = deck_builder._build('Long', sections, 'Presentation', False, True).page  # at the default budget
     assert half > deck_builder.DENSE_AFTER and dense < half * 0.8
     assert deck_builder.TEXT_BUDGET == deck_builder.CONTENT_H * deck_builder.TEXT_FILL  # budget restored afterwards
+
+
+def test_repeated_section_headings_are_not_chapters(tmp_path):
+    """A heading size used several times per page is a section heading, however large."""
+    import pymupdf
+    doc = pymupdf.open()
+    for n in range(4):
+        page = doc.new_page()
+        if n == 0:
+            page.insert_text((60, 80), 'Quarterly Operations Report', fontsize=22)
+        for k, y in enumerate((150, 420)):
+            page.insert_text((60, y), f'Section {n}-{k} Heading', fontsize=20)
+            page.insert_textbox((60, y + 15, 520, y + 200), 'Body text about operations and results. ' * 25, fontsize=10)
+    info = pdf_structure.analyze(doc)
+    assert info['chapters'] == {}
+    assert info['cover_title'] == 'Quarterly Operations Report'  # the heading further down is not swept in
+
+
+def test_headingless_document_uses_its_title_on_slides(tmp_path):
+    md = tmp_path / 'document.md'
+    md.write_text('\n\n'.join(['A plain paragraph of body text about automation for small businesses. ' * 4] * 12))
+    buffer, title, _ = build_from_markdown(md, 'standard', pdf_path='field_notes.pdf')
+    text = ' '.join(sh.text_frame.text for s in Presentation(buffer).slides for sh in s.shapes if sh.has_text_frame)
+    assert title == 'Field Notes' and 'Overview' not in text and 'Field Notes (cont.)' in text
+    assert not pdf_to_md._good_title('(anonymous)')
+
+
+def test_repeated_banner_graphics_are_dropped(tmp_path):
+    """A running header drawn as artwork repeats on every page of its chapter."""
+    (tmp_path / 'images').mkdir()
+    banner = Image.new('RGB', (900, 220), 'white')
+    banner.paste((30, 60, 140), (40, 60, 620, 160))
+    for n in range(3):
+        banner.save(tmp_path / 'images' / f'h{n}.png')
+    shutil.copy(FIXTURES / 'images' / 'photo2.png', tmp_path / 'images' / 'photo.png')
+    md = '\n\n'.join(f'![](images/{n})' for n in ('h0.png', 'photo.png', 'h1.png', 'h2.png'))
+    assert pdf_to_md.filter_images(md, tmp_path).strip() == '![](images/photo.png)'
