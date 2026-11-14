@@ -18,6 +18,14 @@ from md_parse import parse_blocks, parse_markdown
 from pipeline import build_from_markdown, load_sections, merge_empty_sections
 
 FIXTURES = Path(__file__).parent / 'fixtures'
+
+
+@pytest.fixture(autouse=True)
+def no_real_llm(monkeypatch):
+    """Tests never contact a real LLM provider: model discovery is fixed and rate-limit state cleared."""
+    monkeypatch.setattr(condense, 'available_models', lambda cfg=None: ['test-model'])
+    condense._cooldown.clear()
+
 SAMPLE = FIXTURES / 'sample.md'
 
 
@@ -906,3 +914,66 @@ def test_page_limits(tmp_path, monkeypatch):
     monkeypatch.setattr(pdf_to_md, 'MAX_PAGES', 5)
     with pytest.raises(pdf_to_md.PdfConversionError, match='the limit is 5'):
         pdf_to_md.convert_pdf(tmp_path / 'six.pdf', tmp_path / 'c')
+
+
+# ---------- LLM client: retired models, rotation ----------
+class _Resp:
+    def __init__(self, code, body=None, headers=None):
+        self.status_code, self._body, self.headers = code, body or {}, headers or {}
+        self.text = json.dumps(self._body)
+
+    def json(self):
+        return self._body
+
+
+def _ok(obj):
+    return _Resp(200, {'choices': [{'message': {'content': json.dumps(obj)}}]})
+
+
+def test_models_are_discovered_and_retired_ones_skipped(monkeypatch):
+    monkeypatch.undo()  # use the real available_models for this test
+    condense._models.update({'for': None, 'list': None})
+    listing = {'data': [{'id': 'whisper-large-v3', 'context_window': 448}, {'id': 'openai/gpt-oss-20b', 'context_window': 131072},
+                        {'id': 'qwen/qwen3.8-27b', 'context_window': 131072}, {'id': 'tiny-chat', 'context_window': 4096},
+                        {'id': 'meta-llama/llama-prompt-guard-2-22m', 'context_window': 512}]}
+    monkeypatch.setattr(condense.requests, 'get', lambda *a, **k: _Resp(200, listing))
+    monkeypatch.setenv('GROQ_API_KEY', 'test')
+    monkeypatch.setenv('LLM_MODEL', 'llama-3.3-70b-versatile')  # configured but retired
+    assert condense.available_models() == ['qwen/qwen3.8-27b', 'openai/gpt-oss-20b']
+    condense._models.update({'for': None, 'list': None})
+    monkeypatch.setattr(condense.requests, 'get', lambda *a, **k: (_ for _ in ()).throw(condense.requests.ConnectionError()))
+    assert condense.available_models() == ['llama-3.3-70b-versatile']  # list unavailable: trust the setting
+    condense._models.update({'for': None, 'list': None})
+
+
+def test_rate_limited_model_is_skipped_without_waiting(monkeypatch):
+    monkeypatch.setattr(condense, 'available_models', lambda cfg=None: ['model-a', 'model-b'])
+    used, slept = [], []
+
+    def post(url, headers=None, json=None, timeout=None):
+        used.append(json['model'])
+        return _Resp(429, headers={'retry-after': '30'}) if json['model'] == 'model-a' else _ok({'title': 'ok'})
+    monkeypatch.setattr(condense.requests, 'post', post)
+    monkeypatch.setattr(condense.time, 'sleep', slept.append)
+    monkeypatch.setenv('GROQ_API_KEY', 'test')
+    assert condense.chat_json('s', 'u') == {'title': 'ok'}
+    assert used == ['model-a', 'model-b'] and slept == []
+    assert condense.chat_json('s', 'u') == {'title': 'ok'} and used[-1] == 'model-b'  # model-a still cooling down
+
+
+def test_retired_model_falls_through_to_the_next(monkeypatch):
+    models = ['old-model', 'new-model']
+    monkeypatch.setattr(condense, 'available_models', lambda cfg=None: list(models))
+    monkeypatch.setattr(condense, '_drop_model', lambda m: models.remove(m))
+
+    def post(url, headers=None, json=None, timeout=None):
+        if json['model'] == 'old-model':
+            return _Resp(404, {'error': {'message': 'The model `old-model` does not exist', 'code': 'model_not_found'}})
+        return _ok({'fixed': ['x']})
+    monkeypatch.setattr(condense.requests, 'post', post)
+    monkeypatch.setenv('GROQ_API_KEY', 'test')
+    assert condense.chat_json('s', 'u') == {'fixed': ['x']} and models == ['new-model']
+
+
+def test_json_wrapped_in_prose_is_still_read():
+    assert condense._parse_json('Here you go:\n```json\n{"a": 1}\n```') == {'a': 1}

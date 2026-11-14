@@ -48,7 +48,9 @@ python app.py               # http://localhost:5000
 ### LLM (free)
 
 The default is Groq's free tier: get a key at https://console.groq.com/keys and set
-`GROQ_API_KEY`. Default model: `llama-3.3-70b-versatile`. Any OpenAI-compatible endpoint
+`GROQ_API_KEY`. The app asks the provider which chat models it currently offers and picks from
+them (preferring Qwen, then GPT-OSS, then Llama), so a retired model never breaks it; when one
+model is rate-limited it moves to the next instead of waiting. Any OpenAI-compatible endpoint
 works through `LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL` (OpenRouter free models, or a local
 Ollama, which needs no key). See `.env.example`. Without a key, only Standard is offered.
 

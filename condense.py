@@ -12,6 +12,8 @@ section and table figures stay exactly as they were in the PDF.
 import json
 import logging
 import os
+import re
+import threading
 import time
 
 import requests
@@ -33,11 +35,23 @@ class LLMError(Exception):
 # ============================================================
 # Client
 # ============================================================
+DEFAULT_MODELS = ('qwen/qwen3.8-27b', 'openai/gpt-oss-120b', 'openai/gpt-oss-20b')
+# Order of preference among whatever the provider currently offers (matched as substrings)
+MODEL_PREFERENCE = ('qwen', 'gpt-oss-120b', 'llama-3.3-70b', 'llama-4', 'llama', 'gpt-oss-20b', 'mistral', 'gemma')
+NOT_CHAT_MODELS = ('whisper', 'guard', 'orpheus', 'tts', 'embed', 'allam', 'rerank')
+MIN_CONTEXT = 16000
+
+_models = {'for': None, 'list': None}   # models discovered for the current provider
+_cooldown = {}                          # model -> time when its rate limit resets
+_models_lock = threading.Lock()
+
+
 def llm_config():
     return {
         'base_url': os.environ.get('LLM_BASE_URL', 'https://api.groq.com/openai/v1').rstrip('/'),
         'api_key': os.environ.get('LLM_API_KEY') or os.environ.get('GROQ_API_KEY', ''),
-        'model': os.environ.get('LLM_MODEL', 'llama-3.3-70b-versatile'),
+        # one model, or several separated by commas, tried in order
+        'models': [m.strip() for m in os.environ.get('LLM_MODEL', '').split(',') if m.strip()],
     }
 
 
@@ -47,50 +61,138 @@ def llm_available():
     return bool(cfg['api_key']) or cfg['base_url'].startswith(('http://localhost', 'http://127.0.0.1'))
 
 
-def chat_json(system, user, max_tokens=1500, retries=5):
-    """Send one chat request and return the parsed JSON object the model replied with."""
-    cfg = llm_config()
+def _headers(cfg):
     headers = {'Content-Type': 'application/json'}
     if cfg['api_key']:
         headers['Authorization'] = f'Bearer {cfg["api_key"]}'
-    payload = {
-        'model': cfg['model'],
-        'temperature': 0.3,
-        'max_tokens': max_tokens,
-        'response_format': {'type': 'json_object'},
-        'messages': [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}],
-    }
-    delay = 2.0
-    for attempt in range(retries):
+    return headers
+
+
+def available_models(cfg=None):
+    """
+    The chat models to use, best first. Providers retire models without notice (a hard-coded
+    one stops working overnight), so the provider's own list is consulted: configured models
+    that still exist come first, then the rest by MODEL_PREFERENCE. If the list can't be
+    fetched, the configured models (or the defaults) are used as given.
+    """
+    cfg = cfg or llm_config()
+    key = (cfg['base_url'], tuple(cfg['models']))
+    with _models_lock:
+        if _models['for'] == key and _models['list']:
+            return list(_models['list'])
+    listed = []
+    try:
+        resp = requests.get(f'{cfg["base_url"]}/models', headers=_headers(cfg), timeout=10)
+        if resp.status_code == 200:
+            for m in resp.json().get('data', []):
+                mid = str(m.get('id', ''))
+                if mid and m.get('active', True) and not any(x in mid.lower() for x in NOT_CHAT_MODELS) \
+                        and (m.get('context_window') or MIN_CONTEXT) >= MIN_CONTEXT:
+                    listed.append(mid)
+    except (requests.RequestException, ValueError) as exc:
+        log.info('Could not list models: %s', exc)
+    if listed:
+        def rank(mid):
+            return next((n for n, pat in enumerate(MODEL_PREFERENCE) if pat in mid.lower()), len(MODEL_PREFERENCE))
+        missing = [m for m in cfg['models'] if m not in listed]
+        if missing:
+            log.warning('Configured model(s) no longer offered: %s', ', '.join(missing))
+        chosen = [m for m in cfg['models'] if m in listed]
+        chosen += sorted((m for m in listed if m not in chosen), key=lambda m: (rank(m), m))
+    else:
+        chosen = cfg['models'] or list(DEFAULT_MODELS)
+    with _models_lock:
+        _models['for'], _models['list'] = key, chosen
+    return list(chosen)
+
+
+def _drop_model(model):
+    with _models_lock:
+        if _models['list'] and model in _models['list'] and len(_models['list']) > 1:
+            _models['list'].remove(model)
+
+
+def _parse_json(content):
+    try:
+        return json.loads(content)
+    except (TypeError, ValueError):
+        m = re.search(r'\{.*\}', content or '', re.S)  # a JSON object wrapped in prose or code fences
+        if m:
+            return json.loads(m.group(0))
+        raise
+
+
+def chat_json(system, user, max_tokens=1500, retries=5):
+    """
+    Send one chat request and return the parsed JSON object the model replied with.
+    Rate limits are per model, so a limited model is skipped in favour of the next one;
+    the call only waits when every model is limited.
+    """
+    cfg = llm_config()
+    headers = _headers(cfg)
+    last_error = 'The AI service did not respond.'
+    for attempt in range(retries + 3):
+        models = available_models(cfg)
+        now = time.time()
+        ready = [m for m in models if _cooldown.get(m, 0) <= now]
+        if not ready:
+            wait = min(60, max(0.5, min(_cooldown[m] for m in models) - now))
+            log.info('All models rate-limited, waiting %.1fs', wait)
+            time.sleep(wait)
+            ready = models
+        model = ready[0]
+        payload = {
+            'model': model,
+            'temperature': 0.3,
+            'max_tokens': max_tokens,
+            'response_format': {'type': 'json_object'},
+            'messages': [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}],
+        }
+        if 'gpt-oss' in model:  # reasoning models: keep the hidden reasoning short, and leave room for it
+            payload.update(reasoning_effort='low', max_tokens=max_tokens + 400)
         try:
             resp = requests.post(f'{cfg["base_url"]}/chat/completions', headers=headers, json=payload, timeout=120)
         except requests.RequestException as exc:
-            if attempt == retries - 1:
-                raise LLMError(f'Could not reach the AI service: {exc}') from exc
-            time.sleep(delay); delay *= 2
+            last_error = f'Could not reach the AI service: {exc}'
+            time.sleep(min(2 ** attempt, 20))
             continue
-        if resp.status_code == 429 or resp.status_code >= 500:
-            if attempt == retries - 1:
-                raise LLMError(f'The AI service is busy (HTTP {resp.status_code}). Try again in a minute.')
-            wait = _retry_after(resp) or delay
-            log.info('LLM HTTP %s, retrying in %.1fs', resp.status_code, wait)
-            time.sleep(min(wait, 60)); delay *= 2
+        if resp.status_code == 429:
+            _cooldown[model] = time.time() + min(_retry_after(resp) or 15, 90)
+            last_error = 'The AI service is busy (rate limit). Try again in a minute.'
             continue
+        if resp.status_code >= 500:
+            last_error = f'The AI service is busy (HTTP {resp.status_code}). Try again in a minute.'
+            time.sleep(min(2 ** attempt, 20))
+            continue
+        if resp.status_code in (400, 404):
+            text = resp.text[:400]
+            if re.search(r'model.{0,40}(not.{0,10}(exist|found)|decommission)|model_not_found', text, re.I):
+                log.warning('Model %s is not available; trying another', model)
+                _drop_model(model)
+                last_error = f'The AI model {model} is no longer available.'
+                if len(models) > 1:
+                    continue
+            elif 'json_validate_failed' in text or 'failed_generation' in text:
+                last_error = 'The AI service returned an unreadable answer.'
+                _cooldown[model] = time.time() + 2  # let another model try
+                continue
+            raise LLMError(f'The AI service rejected the request (HTTP {resp.status_code}): {text[:300]}')
         if resp.status_code >= 400:
             raise LLMError(f'The AI service rejected the request (HTTP {resp.status_code}): {resp.text[:300]}')
         try:
-            content = resp.json()['choices'][0]['message']['content']
-            return json.loads(content)
-        except (KeyError, IndexError, ValueError) as exc:
-            if attempt == retries - 1:
-                raise LLMError('The AI service returned an unreadable answer.') from exc
-    raise LLMError('The AI service did not respond.')
+            reply = _parse_json(resp.json()['choices'][0]['message']['content'])
+            if isinstance(reply, dict):
+                return reply
+            last_error = 'The AI service returned an unreadable answer.'
+        except (KeyError, IndexError, TypeError, ValueError):
+            last_error = 'The AI service returned an unreadable answer.'
+    raise LLMError(last_error)
 
 
 def _retry_after(resp):
     try:
         return float(resp.headers.get('retry-after', ''))
-    except ValueError:
+    except (TypeError, ValueError):
         return None
 
 
