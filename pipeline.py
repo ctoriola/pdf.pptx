@@ -109,7 +109,7 @@ def convert(pdf_path, work_dir, mode='standard', theme='coral', title=None, prog
     progress = progress or (lambda msg: None)
     work_dir = Path(work_dir)
     progress('Reading the PDF (layout, text, tables and images)…')
-    md_path = convert_pdf(pdf_path, work_dir / 'markdown', progress)
+    md_path = convert_pdf(pdf_path, work_dir / 'markdown', progress, uses_llm=get_plan(mode)['uses_llm'])
     buffer, title, slide_total = build_from_markdown(md_path, mode, theme, title, source_name or pdf_path, progress)
     out = work_dir / (safe_filename(title) + '.pptx')
     out.write_bytes(buffer.getvalue())

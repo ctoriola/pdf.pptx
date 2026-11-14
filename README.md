@@ -88,7 +88,9 @@ Without the four `B2_*` variables the app falls back to direct uploads:
 | 4.5 MB request body | PDFs over ~4.4 MB can't be uploaded | Checked in the browser and on the server, with a clear message |
 | 4.5 MB response body | Image-heavy decks could exceed it | The pictures inside the .pptx are recompressed in steps until it fits |
 
-Either way, the function stops after 300 seconds, so `MAX_PAGES` (default 80) caps the input.
+Either way, the function stops after 300 seconds. Conversion takes about 0.2–0.5 s per page, so
+`MAX_PAGES` defaults to 300. The AI slide types have their own cap, `MAX_AI_PAGES` (default 120):
+they send the text to the LLM, whose free tier is rate-limited per minute.
 
 On other hosts (Render, Railway, Fly.io) direct uploads default to 50 MB:
 
@@ -96,7 +98,8 @@ On other hosts (Render, Railway, Fly.io) direct uploads default to 50 MB:
 gunicorn -w 2 --timeout 300 -b 0.0.0.0:8000 app:app
 ```
 
-Settings: `MAX_UPLOAD_MB`, `MAX_RESPONSE_MB` (0 = no limit), `MAX_STORAGE_UPLOAD_MB`, `MAX_PAGES`.
+Settings: `MAX_UPLOAD_MB`, `MAX_RESPONSE_MB` (0 = no limit), `MAX_STORAGE_UPLOAD_MB`, `MAX_PAGES`,
+`MAX_AI_PAGES`.
 
 Scanned PDFs (no text layer) are rejected with a message suggesting OCR first. Tesseract isn't
 available on Vercel.

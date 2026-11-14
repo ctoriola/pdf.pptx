@@ -29,14 +29,17 @@ LOGO_MAX_PX = 400           # at 150 dpi, under ~2.7in: small enough to be a hea
 BANNER_ASPECT = 2.5         # this much wider than tall (or taller than wide) reads as a banner
 DUPLICATE_DISTANCE = 6      # perceptual-hash bits that may differ between copies of one picture
 MAX_IMAGE_PX = 1600         # longest side after recompression
-MAX_PAGES = int(os.environ.get('MAX_PAGES', 80))
+MAX_PAGES = int(os.environ.get('MAX_PAGES', 300))        # about 0.2-0.5 s/page; Vercel allows 300 s
+# The AI slide types send the text to the LLM, whose free tier is rate-limited per minute,
+# so they stop being able to finish inside one request well before Standard does
+MAX_AI_PAGES = int(os.environ.get('MAX_AI_PAGES', 120))
 
 
 class PdfConversionError(Exception):
     """The PDF could not be converted (corrupt, encrypted, too long, no text)."""
 
 
-def convert_pdf(pdf_path, out_dir, progress=None):
+def convert_pdf(pdf_path, out_dir, progress=None, uses_llm=False):
     """
     Convert a PDF. Returns the path of the written Markdown file; images are saved
     under out_dir/images and referenced as images/<name> relative to the Markdown file.
@@ -59,6 +62,10 @@ def convert_pdf(pdf_path, out_dir, progress=None):
             raise PdfConversionError('This PDF is password-protected. Remove the password and try again.')
         if doc.page_count > MAX_PAGES:
             raise PdfConversionError(f'This PDF has {doc.page_count} pages; the limit is {MAX_PAGES}.')
+        if uses_llm and doc.page_count > MAX_AI_PAGES:
+            raise PdfConversionError(
+                f'This PDF has {doc.page_count} pages. The AI slide types (Condensed and Detailed) handle up to '
+                f'{MAX_AI_PAGES} pages; choose Standard, which handles up to {MAX_PAGES}.')
         meta_title = (doc.metadata or {}).get('title', '')
         try:
             info = pdf_structure.analyze(doc)

@@ -889,3 +889,20 @@ def test_repeated_banner_graphics_are_dropped(tmp_path):
     shutil.copy(FIXTURES / 'images' / 'photo2.png', tmp_path / 'images' / 'photo.png')
     md = '\n\n'.join(f'![](images/{n})' for n in ('h0.png', 'photo.png', 'h1.png', 'h2.png'))
     assert pdf_to_md.filter_images(md, tmp_path).strip() == '![](images/photo.png)'
+
+
+def test_page_limits(tmp_path, monkeypatch):
+    """Standard takes long PDFs; the AI slide types have a lower cap with a message pointing to Standard."""
+    import pymupdf
+    assert pdf_to_md.MAX_PAGES >= 300
+    doc = pymupdf.open()
+    for n in range(6):
+        doc.new_page().insert_textbox((60, 60, 520, 700), f'Page {n} body text about first aid and care. ' * 20, fontsize=10)
+    doc.save(tmp_path / 'six.pdf')
+    monkeypatch.setattr(pdf_to_md, 'MAX_AI_PAGES', 5)
+    assert pdf_to_md.convert_pdf(tmp_path / 'six.pdf', tmp_path / 'a').exists()  # Standard: fine
+    with pytest.raises(pdf_to_md.PdfConversionError, match='choose Standard'):
+        pdf_to_md.convert_pdf(tmp_path / 'six.pdf', tmp_path / 'b', uses_llm=True)
+    monkeypatch.setattr(pdf_to_md, 'MAX_PAGES', 5)
+    with pytest.raises(pdf_to_md.PdfConversionError, match='the limit is 5'):
+        pdf_to_md.convert_pdf(tmp_path / 'six.pdf', tmp_path / 'c')
