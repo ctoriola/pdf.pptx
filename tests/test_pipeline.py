@@ -664,7 +664,7 @@ def test_one_off_tagline_heading_does_not_swallow_the_document():
     md = ('## **DICON-FIPCO**\n\nIntro.\n\n# **BUILT FOR A STRONGER TOMORROW.**\n\nEngine oil.\n\n'
           '## **WELCOME**\n\nText.\n\n## **WHY DEFENCE**\n\nText.\n\n### **D S O - 1**\n\nText.')
     out = pdf_to_md.normalize_headings(md)
-    assert '## BUILT FOR A STRONGER TOMORROW.' in out and '## WELCOME' in out and '## WHY DEFENCE' in out
+    assert '## Built for a Stronger Tomorrow.' in out and '## Welcome' in out and '## Why Defence' in out
     assert '### D S O - 1' in out
 
 
@@ -718,7 +718,7 @@ def test_brochure_end_to_end(tmp_path):
     text = ' '.join(sh.text_frame.text for s in prs.slides for sh in s.shapes if sh.has_text_frame)
     assert '<br>' not in text and '<sup>' not in text
     assert text.count('(cont.)') <= 1
-    assert 'WHY DEFENCE NEEDS A TRUSTED OIL SOURCE' in text
+    assert 'Why Defence Needs a Trusted Oil Source' in text
     picture_slides = [i for i, s in enumerate(prs.slides) if any(sh.shape_type == 13 for sh in s.shapes)]
     assert len(picture_slides) >= 3  # images sit with their sections, not piled at the end
     assert len(pictures(prs)) == 3  # the coolant picture appears three times in the PDF, once in the deck
@@ -738,3 +738,117 @@ def test_text_per_slide_is_halved():
     sizes = {r.font.size.pt for s in Presentation(buffer).slides for sh in s.shapes if sh.has_text_frame
              for p in sh.text_frame.paragraphs for r in p.runs if r.text.startswith('Extreme')}
     assert min(sizes) >= READABLE_PT
+
+
+# ---------- handbook-style documents: chapters, front matter, lists ----------
+import pdf_structure  # noqa: E402
+
+HANDBOOK = FIXTURES / 'handbook.pdf'
+
+
+def test_chapters_and_title_are_read_from_font_sizes():
+    import pymupdf
+    info = pdf_structure.analyze(pymupdf.open(HANDBOOK))
+    assert list(info['chapters'].values()) == ['GENERAL CONCEPTS OF FIRST AID', 'CARE FOR ADULTS (18 AND OVER)']
+    assert info['cover_title'] == 'FAH First Aid Handbook'  # contents heading and giant numerals ignored
+    assert 'FAH' in info['acronyms']
+
+
+def test_front_matter_is_dropped_and_chapters_marked(tmp_path):
+    text = pdf_to_md.convert_pdf(HANDBOOK, tmp_path).read_text()
+    assert text.startswith('# FAH First Aid Handbook')
+    assert 'All rights reserved' not in text and 'CONTENTS' not in text.upper() and '. . . .' not in text
+    assert '## General Concepts of First Aid {.chapter}' in text
+    assert '## Care for Adults (18 and Over) {.chapter}' in text
+    assert text.count('General Concepts of First Aid') == 1  # running header on the next page removed
+    assert '## Step by Step' in text and 'CHAPTER' not in text.replace('{.chapter}', '')
+
+
+def test_handbook_deck_has_chapter_slides_and_numbered_steps(tmp_path):
+    from pipeline import convert
+    pptx, _, title, slides = convert(HANDBOOK, tmp_path, 'standard', source_name='handbook.pdf')
+    prs = Presentation(str(pptx))
+    texts = [' | '.join(sh.text_frame.text for sh in s.shapes if sh.has_text_frame) for s in prs.slides]
+    assert title == 'FAH First Aid Handbook'
+    assert sum('CHAPTER 1' in t for t in texts) == 1 and sum('CHAPTER 2' in t for t in texts) == 1
+    assert 'next 2 chapters' in texts[1]  # the agenda lists chapters, not every section
+    steps = next(t for t in texts if 'Step by Step' in t and 'Check that the person' in t)
+    assert '3.\tOpen the airway' in steps and 'a.\tPut your hand' in steps and '4.\tGive care' in steps
+    wide = next(s for s in prs.slides if any(sh.shape_type == 13 and sh.width > sh.height * 2.2 for sh in s.shapes))
+    pic = next(sh for sh in wide.shapes if sh.shape_type == 13)
+    assert Emu(pic.width).inches > 8  # the wide diagram gets the slide's full width
+    assert_on_slide(prs)
+
+
+def test_picture_text_toc_and_legal_detection():
+    text = 'Before\n\n<!-- Start of picture text -->\nA B C<br>D E F<br><!-- End of picture text -->\n\nAfter'
+    assert pdf_structure.strip_picture_text(text).split() == ['Before', 'After']
+    toc = '##### **TABLE**<sup>_of_</sup> **CONTENTS**\n\nIntro . . . . . . 4\n\nAED Steps – 15'
+    assert pdf_structure.is_toc_page(toc)
+    assert pdf_structure.is_toc_page('\n'.join(f'Section {n} . . . . . {n}' for n in range(8)))
+    assert not pdf_structure.is_toc_page('## Real section\n\nA paragraph of normal text about first aid.\n\n- one\n- two')
+    assert pdf_structure.is_legal_page('Copyright © 2023 Some Publisher\n\nAll rights reserved.')
+
+
+def test_smart_title_keeps_acronyms():
+    assert pdf_structure.smart_title('USE OF AUTOMATED EXTERNAL DEFIBRILLATOR') == 'Use of Automated External Defibrillator'
+    assert pdf_structure.smart_title('ONE-RESCUER BLS/CPR FOR ADULTS', {'BLS', 'CPR'}) == 'One-Rescuer BLS/CPR for Adults'
+    assert pdf_structure.smart_title('A I RWAY') == 'Airway'
+    assert pdf_structure.smart_title('Already Mixed Case') == 'Already Mixed Case'
+
+
+def test_list_parsing_handles_pdf_quirks():
+    md = ('- The importance of early CPR has been re-emphasized. The\n\n'
+          '- risk of harm to the patient is low.\n\n'
+          '   - A sixth link, Recovery, was added.\n')
+    block = parse_blocks(md)[0]
+    assert block['items'] == ['The importance of early CPR has been re-emphasized. The risk of harm to the patient is low.',
+                              'A sixth link, Recovery, was added.']
+    assert block['levels'] == [0, 0]  # stray indentation in a bullet list is not nesting
+    steps = parse_blocks('5. Stop pressing.\n\n6. Open the airway.\n\n   - a. Tilt the head.\n\n   - b. Lift the jaw.\n\n7. Give a breath.')[0]
+    assert steps['labels'] == ['5.', '6.', 'a.', 'b.', '7.'] and steps['levels'] == [0, 0, 1, 1, 0]
+    glued = parse_blocks('- 3.Assess breathing.\n\n- 4.If you cannot feel a pulse, begin CPR.')[0]
+    assert glued['labels'] == ['3.', '4.'] and glued['items'][1].startswith('If you cannot')
+
+
+def test_pull_quote_and_broken_paragraph_are_repaired():
+    blocks = parse_blocks('The blood returns to the heart and is pumped to the organs—as\n\n'
+                          '_**Taking the right action quickly can make the difference between life and death.**_\n\n'
+                          'well as the rest of the body.')
+    assert [b['type'] for b in blocks] == ['quote', 'para']
+    assert blocks[1]['text'].endswith('organs—as well as the rest of the body.')
+    spliced = pdf_to_md.repair_spliced_pullquotes(
+        'Once in place, the compression to breath **_The compression rate for_** ratio should be adjusted. '
+        '**_all persons is always 100-120 per minute._**')
+    assert 'compression to breath ratio should be adjusted.' in spliced
+    assert '_**The compression rate for all persons is always 100-120 per minute.**_' in spliced
+
+
+def test_page_breaks_keep_sub_points_and_avoid_orphans():
+    from deck_builder import CONTENT_W, TEXT_BUDGET, split_blocks
+    quiz = {'type': 'list', 'ordered': True, 'items': [], 'labels': [], 'levels': []}
+    for n in range(1, 6):
+        quiz['items'] += [f'Question number {n} asks what the rescuer should do next in this situation?'] + \
+                         [f'Option {x} for question {n}' for x in 'abcd']
+        quiz['labels'] += [f'{n}.', 'a.', 'b.', 'c.', 'd.']
+        quiz['levels'] += [0, 1, 1, 1, 1]
+    pages = split_blocks([quiz], CONTENT_W, TEXT_BUDGET)
+    assert len(pages) >= 2
+    for page in pages:
+        assert page[0]['levels'][0] == 0  # no slide opens with a stranded "b." option
+        assert page[0]['labels'].count('d.') == sum(lv == 0 for lv in page[0]['levels'])  # whole questions only
+    intro = [{'type': 'para', 'text': 'Keys for first aid:'},
+             {'type': 'list', 'ordered': False, 'items': ['Short point about care.'] * 9}]
+    pages = split_blocks(intro, CONTENT_W, TEXT_BUDGET)
+    assert pages[0][0]['type'] == 'para' and pages[0][1]['type'] == 'list'  # the intro line stays with its list
+    assert all(sum(len(b.get('items', [1])) for b in pg) >= 2 for pg in pages)  # no single-item last page
+
+
+def test_long_documents_use_fuller_slides():
+    import deck_builder
+    para = {'type': 'para', 'text': 'Extreme pressure performance protects against metal contact under load. ' * 6}
+    sections = [(f'Topic {n}', [dict(para), dict(para), dict(para)]) for n in range(60)]
+    _, dense = deck_builder.build_deck('Long', sections)
+    half = deck_builder._build('Long', sections, 'Presentation', False, True).page  # at the default budget
+    assert half > deck_builder.DENSE_AFTER and dense < half * 0.8
+    assert deck_builder.TEXT_BUDGET == deck_builder.CONTENT_H * deck_builder.TEXT_FILL  # budget restored afterwards

@@ -254,6 +254,7 @@ def expand_sections(doc_title, sections, plan, progress=None):
         target = min(MAX_DETAILED_WORDS, max(plan['words'], int(words * 1.3)))
         reply = chat_json(SYSTEM, detailed_prompt(doc_title, name, source_text(doc_title, name, text_blocks), target),
                           max_tokens=min(3000, target * 2 + 200))
-        title = str(reply.get('title') or name).strip()
-        out.append((title, _body_blocks(reply) + kept))
+        chapter = [b for b in blocks[:1] if b['type'] == 'chapter']
+        title = name if chapter else str(reply.get('title') or name).strip()  # chapter titles stay as printed
+        out.append((title, chapter + _body_blocks(reply) + kept))
     return out

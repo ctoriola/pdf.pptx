@@ -100,7 +100,7 @@ def repair_sections(title, sections, progress=None):
     strings = [title or ''] + [name for name, _ in sections]
     for _, blocks in sections:
         for b in blocks:
-            if b['type'] in ('para', 'sub'):
+            if b['type'] in ('para', 'sub', 'quote'):
                 strings.append(b['text'])
             elif b['type'] == 'list':
                 strings += b['items']
@@ -118,7 +118,7 @@ def repair_sections(title, sections, progress=None):
         new_blocks = []
         for b in blocks:
             b = dict(b)
-            if b['type'] in ('para', 'sub'):
+            if b['type'] in ('para', 'sub', 'quote'):
                 b['text'] = fix(b['text'])
             elif b['type'] == 'list':
                 b['items'] = [fix(i) for i in b['items']]

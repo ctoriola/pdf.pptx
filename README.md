@@ -17,13 +17,13 @@ PDF ──PyMuPDF──▶ Markdown + images ──parse──▶ sections ─�
 
 | Stage | File | What it does |
 |---|---|---|
-| 1. PDF → Markdown | `pdf_to_md.py` | pymupdf4llm with its layout model: headings, paragraphs, lists, tables, figures. Page headers/footers are dropped. Each figure is saved to `images/` and referenced in the Markdown where it appeared. Heading levels are normalised to `# Title` / `## Section` / `### Sub`; bold lines on their own become headings. Icons, thin rules, blank boxes, duplicates and logos repeated on 3+ pages are filtered out; photos are recompressed to JPEG. |
-| 2. Sections | `md_parse.py`, `pipeline.py` | Split on `##` headings into blocks (para, sub-heading, list, table, image). `Figure 3: …` paragraphs (plain or italic) become image captions. Empty headings merge into the next section. |
+| 1. PDF → Markdown | `pdf_to_md.py`, `pdf_structure.py` | pymupdf4llm with its layout model, page by page: headings, paragraphs, lists, tables, figures; page headers/footers dropped; each figure saved to `images/` and referenced where it appeared. `pdf_structure.py` then recovers what the converter gets wrong, from the PDF's own font sizes: **chapter titles** (the display-size headings, often scrambled or skipped), the **document title** from the cover, and it drops **contents, copyright and bare cover pages** and the text inside figures. Heading levels are normalised to `# Title` / `## Section` / `### Sub`, ALL-CAPS headings become Title Case (the document's acronyms kept). Icons, rules, blank boxes, resized duplicates and header logos are filtered; photos are recompressed. |
+| 2. Sections | `md_parse.py`, `pipeline.py` | Split on `##` headings into blocks (para, pull-quote, sub-heading, list, table, image); `## X {.chapter}` opens a chapter. Lists keep their real numbers and `a.`/`b.` sub-points; bullets and paragraphs the PDF cut mid-sentence are rejoined. `Figure 3: …` lines and italic titles above a figure become captions. |
 | 3. LLM (optional) | `condense.py` | Rewrites sections for the Condensed and Detailed slide types. Images and tables are taken out before the call and put back afterwards, so figures stay with their section and table data stays exact. |
 | 4. Slide plan | `slide_plan.py` | The three slide types and their word budgets. |
 | 5. Deck | `deck_builder.py` | Picks a layout per section (table, stat cards, numbered cards, lead + body, text + image, image gallery), sizes text to fit, and continues long sections on "(cont.)" slides. Three themes. |
 
-Each slide carries at most half the text it could physically hold (`TEXT_FILL = 0.5` in `deck_builder.py`), set as large as the box allows up to 24pt, so slides stay presentable rather than reading like pages. Long sections split at their own sub-headings; short ones share a slide, keeping numbered lists together.
+Each slide carries at most half the text it could physically hold (`TEXT_FILL = 0.5` in `deck_builder.py`), set as large as the box allows up to 24pt. Past 90 slides the budget grows automatically (to at most 85%) so a long handbook stays a usable length. Chapters get divider slides and drive the agenda and slide badges. Long sections split at their own sub-headings; short ones share a slide, keeping numbered lists together. Page breaks are balanced, never strand a list's last item or separate a question from its options, and wide diagrams get the slide's full width.
 
 ## Slide types
 
@@ -115,6 +115,8 @@ pip install pytest
 python -m pytest -q
 ```
 
-The tests run the real PDF conversion on `tests/fixtures/sample.pdf` (headings, a running
-header/footer, a table and three figures), plus parsing, image filtering, LLM handling (HTTP
-stubbed), size control, the Flask routes, and decks in every slide type and theme.
+The tests run the real PDF conversion on three fixtures in `tests/fixtures/`: `sample.pdf` (a
+simple report), `brochure.pdf` (tagline heading, letter-spaced labels, repeated pictures) and
+`handbook.pdf` (cover, copyright and contents pages, display-size chapter titles, numbered steps
+with sub-points, a wide diagram, a quiz). They also cover parsing, image filtering, LLM handling
+(HTTP stubbed), page breaking, size control, B2 storage and the Flask routes.

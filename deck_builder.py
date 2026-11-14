@@ -21,7 +21,7 @@ from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.oxml.ns import qn
 from pptx.util import Emu, Inches, Pt
 
-from md_parse import inline_runs, plain
+from md_parse import inline_runs, list_labels, list_levels, plain, slice_list
 
 
 # ---------- Themes ----------
@@ -76,6 +76,10 @@ READABLE_PT = 16  # below this, continue on another slide instead
 # 0.5 = half the text a slide could physically hold, which presents far better.
 TEXT_FILL = 0.5
 TEXT_BUDGET = CONTENT_H * TEXT_FILL
+# Long documents: past DENSE_AFTER slides the budget grows (up to MAX_TEXT_FILL) so a 60-page
+# handbook becomes a deck of a usable length instead of 250 half-empty slides.
+DENSE_AFTER = 90
+MAX_TEXT_FILL = 0.85
 
 
 def fits_budget(blocks, width):
@@ -101,7 +105,7 @@ def text_height(blocks, width_in, size_pt):
     per_line = max(10, int(width_in / char_w))
     height = 0.0
     for b in blocks:
-        if b['type'] == 'para':
+        if b['type'] in ('para', 'quote'):
             height += math.ceil(len(plain(b['text'])) / per_line) * line_h + size_pt * 0.6 / 72
         elif b['type'] == 'sub':
             height += line_h * 1.15 + size_pt * 0.9 / 72
@@ -120,38 +124,86 @@ def fit_size(blocks, width_in, height_in, floor=MIN_BODY_PT):
     return None
 
 
-def split_blocks(blocks, width_in, height_in):
-    """Split blocks into pages that fit at a readable size (splitting long lists and paragraphs)."""
-    size = READABLE_PT
-    pages, page, expanded = [], [], []
+def _atoms(blocks, width_in, height_in):
+    """Break blocks into pieces that may be separated: sentences of long paragraphs, single list items."""
+    size, atoms = READABLE_PT, []
     for b in blocks:
-        if b['type'] == 'list' and text_height([b], width_in, size) > height_in * 0.6:
-            for k in range(0, len(b['items']), 4):
-                expanded.append({**b, 'items': b['items'][k:k + 4]})
+        if b['type'] == 'list':
+            for k in range(len(b['items'])):
+                atoms.append({**slice_list(b, k, k + 1), '_src': id(b)})
         elif b['type'] == 'para' and text_height([b], width_in, size) > height_in * 0.6:
             chunk = ''
             for sentence in re.split(r'(?<=[.!?])\s+', b['text']):
                 candidate = (chunk + ' ' + sentence).strip()
                 if chunk and text_height([{'type': 'para', 'text': candidate}], width_in, size) > height_in * 0.5:
-                    expanded.append({'type': 'para', 'text': chunk})
+                    atoms.append({'type': 'para', 'text': chunk})
                     candidate = sentence
                 chunk = candidate
             if chunk:
-                expanded.append({'type': 'para', 'text': chunk})
+                atoms.append({'type': 'para', 'text': chunk})
         else:
-            expanded.append(b)
-    for b in expanded:
-        if page and text_height(page + [b], width_in, size) > height_in:
+            atoms.append(b)
+    return atoms
+
+
+def _stays_with_next(atom, nxt):
+    """Never break after a sub-heading, after a line introducing a list, or between an item and its sub-points."""
+    if atom['type'] == 'sub':
+        return True
+    if nxt['type'] == 'list':
+        if atom['type'] == 'para' and plain(atom['text']).rstrip().endswith(':'):
+            return True
+        if atom['type'] == 'list' and atom.get('_src') == nxt.get('_src') and list_levels(nxt)[0] > 0:
+            return True  # sub-points stay with their item (a quiz question with its options)
+    return False
+
+
+def _join_lists(page):
+    """Put neighbouring items of the same source list back into one list block."""
+    out = []
+    for b in page:
+        prev = out[-1] if out else None
+        if b['type'] == 'list' and prev and prev['type'] == 'list' and prev.get('_src') == b.get('_src'):
+            out[-1] = {**prev, 'items': prev['items'] + b['items'], 'labels': list_labels(prev) + list_labels(b),
+                       'levels': list_levels(prev) + list_levels(b)}
+        else:
+            out.append(dict(b))
+    return out
+
+
+def split_blocks(blocks, width_in, height_in):
+    """
+    Split blocks into pages of at most height_in (at the readable size). Pages are balanced, so
+    the last one is not left with a single line, and related pieces stay together.
+    """
+    size = READABLE_PT
+    atoms = _atoms(blocks, width_in, height_in)
+    if not atoms:
+        return []
+    heights = [text_height([a], width_in, size) for a in atoms]
+    total = sum(heights)
+    target = total / max(1, math.ceil(total / height_in))  # even share per page
+    pages, page, used = [], [], 0.0
+    for n, (atom, h) in enumerate(zip(atoms, heights)):
+        glued = bool(page) and _stays_with_next(page[-1], atom)
+        # how much the pieces glued to this one will need: keep them on the same page
+        tail, k = h, n
+        while k + 1 < len(atoms) and _stays_with_next(atoms[k], atoms[k + 1]):
+            k += 1
+            tail += heights[k]
+        if page and not glued and (used + tail > height_in or used >= target * 0.95):
             pages.append(page)
-            page = []
-        page.append(b)
+            page, used = [], 0.0
+        page.append(atom)
+        used += h
     if page:
         pages.append(page)
-    # A subheading shouldn't end a page
-    for n in range(len(pages) - 1):
-        if pages[n] and pages[n][-1]['type'] == 'sub' and len(pages[n]) > 1:
-            pages[n + 1].insert(0, pages[n].pop())
-    return pages
+    # A nearly empty last page joins the one before it (the text is set a little smaller instead)
+    if len(pages) > 1:
+        last = text_height(pages[-1], width_in, size)
+        if last < height_in * 0.3 and text_height(pages[-2], width_in, size) + last <= height_in * 1.3:
+            pages[-2:] = [pages[-2] + pages[-1]]
+    return [_join_lists(pg) for pg in pages]
 
 
 # ============================================================
@@ -205,31 +257,49 @@ def add_text(slide, x, y, w, h, text, size, color=None, bold=False, italic=False
     return box
 
 
-def _bullet(paragraph, autonum=False, indent_in=0.3):
-    """Give a paragraph a real bullet (hanging indent) in the accent colour."""
-    pPr = paragraph._p.get_or_add_pPr()
-    pPr.set('marL', str(Emu(Inches(indent_in))))
-    pPr.set('indent', str(-Emu(Inches(indent_in))))
-    for tag in ('a:buClr', 'a:buChar', 'a:buAutoNum', 'a:buNone', 'a:buFont'):
+def _clear_bullets(pPr):
+    for tag in ('a:buClr', 'a:buChar', 'a:buAutoNum', 'a:buNone', 'a:buFont', 'a:tabLst'):
         for el in pPr.findall(qn(tag)):
             pPr.remove(el)
+
+
+def _bullet(paragraph, left_in=0.0, indent_in=0.3):
+    """Give a paragraph a real bullet (hanging indent) in the accent colour."""
+    pPr = paragraph._p.get_or_add_pPr()
+    pPr.set('marL', str(Emu(Inches(left_in + indent_in))))
+    pPr.set('indent', str(-Emu(Inches(indent_in))))
+    _clear_bullets(pPr)
     clr = pPr.makeelement(qn('a:buClr'), {})
     clr.append(clr.makeelement(qn('a:srgbClr'), {'val': _rgb_hex(T.accent)}))
     pPr.append(clr)
-    if autonum:
-        pPr.append(pPr.makeelement(qn('a:buAutoNum'), {'type': 'arabicPeriod'}))
-    else:
-        pPr.append(pPr.makeelement(qn('a:buFont'), {'typeface': 'Arial'}))
-        pPr.append(pPr.makeelement(qn('a:buChar'), {'char': '•'}))
+    pPr.append(pPr.makeelement(qn('a:buFont'), {'typeface': 'Arial'}))
+    pPr.append(pPr.makeelement(qn('a:buChar'), {'char': '•'}))
+
+
+def _labelled(paragraph, left_in, hang_in):
+    """
+    Hanging indent for an item whose label ("6.", "a.") is typed as text followed by a tab.
+    Real text keeps the numbering right when a list continues on the next slide, and renders
+    the same in PowerPoint, Keynote and Google Slides.
+    """
+    pPr = paragraph._p.get_or_add_pPr()
+    pPr.set('marL', str(Emu(Inches(left_in + hang_in))))
+    pPr.set('indent', str(-Emu(Inches(hang_in))))
+    _clear_bullets(pPr)
+    pPr.append(pPr.makeelement(qn('a:buNone'), {}))
+    tabs = pPr.makeelement(qn('a:tabLst'), {})
+    tabs.append(tabs.makeelement(qn('a:tab'), {'pos': str(Emu(Inches(left_in + hang_in))), 'algn': 'l'}))
+    pPr.append(tabs)
 
 
 def add_rich_text(slide, x, y, w, h, blocks, size):
-    """Render para/sub/list blocks into one text box at the given size."""
+    """Render para/quote/sub/list blocks into one text box at the given size."""
     box = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
     tf = box.text_frame
     tf.word_wrap = True
     tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = 0
     first = True
+    hang = size / 72 * 1.9  # room for a label such as "10."
 
     def new_par():
         nonlocal first
@@ -238,27 +308,40 @@ def add_rich_text(slide, x, y, w, h, blocks, size):
         p.line_spacing = 1.1
         return p
 
+    def add_runs(p, text, color=None, force_bold=False, force_italic=False, run_size=None):
+        for t, bold, italic in inline_runs(text):
+            r = p.add_run(); r.text = t
+            _style(r, run_size or size, color or (T.ink if bold else T.body), bold or force_bold,
+                   italic or force_italic)
+
     for b in blocks:
         if b['type'] == 'para':
             p = new_par()
             p.space_after = Pt(size * 0.6)
-            for t, bold, italic in inline_runs(b['text']):
-                r = p.add_run(); r.text = t
-                _style(r, size, T.ink if bold else T.body, bold, italic)
+            add_runs(p, b['text'])
+        elif b['type'] == 'quote':
+            p = new_par()
+            p.space_before = Pt(size * 0.2)
+            p.space_after = Pt(size * 0.7)
+            add_runs(p, b['text'], T.accent_strong, True, True, size + 1)
         elif b['type'] == 'sub':
             p = new_par()
             p.space_before = Pt(size * 0.4)
             p.space_after = Pt(size * 0.3)
             r = p.add_run(); r.text = plain(b['text'])
             _style(r, size + 2, T.accent_strong, True, font=T.head_font)
-        elif b['type'] == 'list':
-            for item in b['items']:
+        elif b['type'] == 'list' and b['items']:
+            for item, label, level in zip(b['items'], list_labels(b), list_levels(b)):
                 p = new_par()
                 p.space_after = Pt(size * 0.35)
-                _bullet(p, autonum=b['ordered'])
-                for t, bold, italic in inline_runs(item):
-                    r = p.add_run(); r.text = t
-                    _style(r, size, T.ink if bold else T.body, bold, italic)
+                left = hang * level
+                if label:
+                    _labelled(p, left, hang)
+                    r = p.add_run(); r.text = label + '\t'
+                    _style(r, size, T.accent_strong, True)
+                else:
+                    _bullet(p, left)
+                add_runs(p, item)
             p.space_after = Pt(size * 0.75)
     return box
 
@@ -324,6 +407,15 @@ def place_image(slide, path, x, y, w, h, caption=''):
     return True
 
 
+WIDE_ASPECT = 2.2
+WIDE_IMAGE_ROOM = 2.3  # inches kept for a wide image under the text
+
+
+def is_wide(path):
+    size = image_size(path)
+    return bool(size) and size[0] >= size[1] * WIDE_ASPECT
+
+
 def is_portrait(path):
     size = image_size(path)
     return bool(size) and size[1] > size[0] * 1.15
@@ -353,9 +445,12 @@ class DeckBuilder:
     def _chrome(self, slide, number, title):
         """Section badge + title + footer on a content slide."""
         fill_background(slide, T.bg)
-        number_badge(slide, MARGIN, 0.62, 0.62, f'{number:02d}', size=15)
+        offset = 0.0
+        if number:  # no badge for material before the first chapter
+            number_badge(slide, MARGIN, 0.62, 0.62, f'{number:02d}', size=15 if number < 100 else 11)
+            offset = 0.85
         size = 30 if len(title) <= 55 else 24 if len(title) <= 80 else 20
-        add_text(slide, MARGIN + 0.85, 0.5, CONTENT_W - 0.85, 0.85, title, size, T.ink, bold=True,
+        add_text(slide, MARGIN + offset, 0.5, CONTENT_W - offset, 0.85, title, size, T.ink, bold=True,
                  anchor=MSO_ANCHOR.MIDDLE, font=T.head_font)
         add_text(slide, MARGIN, 7.0, 8, 0.3, self.title, 10, T.muted)
         add_text(slide, SLIDE_W - MARGIN - 1, 7.0, 1, 0.3, str(self.page), 10, T.muted, align=PP_ALIGN.RIGHT)
@@ -374,11 +469,11 @@ class DeckBuilder:
                  anchor=MSO_ANCHOR.TOP, line_spacing=0.95)
         add_text(slide, MARGIN + 0.1, 6.35, 7, 0.4, date.today().strftime('%B %Y'), 14, T.cover_muted)
 
-    def agenda(self, section_names):
+    def agenda(self, section_names, noun='sections'):
         slide = self._new_slide()
         fill_background(slide, T.bg)
         add_text(slide, MARGIN, 0.55, 4.4, 0.9, 'Agenda', 36, T.ink, bold=True, font=T.head_font)
-        add_text(slide, MARGIN, 1.4, 4.4, 1.2, f'What we\'ll cover in the next {len(section_names)} sections.', 16,
+        add_text(slide, MARGIN, 1.4, 4.4, 1.2, f'What we\'ll cover in the next {len(section_names)} {noun}.', 16,
                  T.muted)
         names = section_names
         per_col = math.ceil(len(names) / 2) if len(names) > 5 else len(names)
@@ -410,7 +505,21 @@ class DeckBuilder:
         add_text(slide, 3.0, 4.65, 7.33, 0.5, 'Questions & discussion', 16, T.cover_muted, align=PP_ALIGN.CENTER)
 
     # ---- section content ----
+    def chapter(self, number, title):
+        """A divider slide that opens a chapter."""
+        slide = self._new_slide()
+        fill_background(slide, T.cover_bg)
+        add_box(slide, 9.6, 2.9, 5.6, 5.6, T.accent, MSO_SHAPE.OVAL)
+        add_box(slide, 11.9, -0.9, 2.6, 2.6, T.accent_strong, MSO_SHAPE.OVAL)
+        add_text(slide, MARGIN + 0.1, 1.9, 6, 0.5, f'CHAPTER {number}', 16, T.accent_soft, bold=True)
+        size = 48 if len(title) <= 28 else 40 if len(title) <= 50 else 32
+        add_text(slide, MARGIN + 0.1, 2.5, 8.6, 3.4, title, size, T.cover_text, bold=True, font=T.head_font,
+                 anchor=MSO_ANCHOR.TOP, line_spacing=0.98)
+
     def section(self, number, name, blocks):
+        blocks = [b for b in blocks if b['type'] != 'chapter']
+        if not blocks:
+            return
         notes = section_notes(name, blocks)
         images = [b for b in blocks if b['type'] == 'image' and image_size(b['path'])]
         text = [b for b in blocks if b['type'] != 'image']
@@ -422,10 +531,45 @@ class DeckBuilder:
         if layout == 'table':
             self._table_slide(number, name, text, notes)
             return self._gallery_slides(number, name, images, notes)
-        side = images[:SIDE_IMAGES_MAX] if self._side_fits(images[:SIDE_IMAGES_MAX], text) else images[:1]
-        self._text_image_slides(number, name, text, side, notes)
-        if images[len(side):]:
-            self._gallery_slides(number, name, images[len(side):], notes)
+        if is_wide(images[0]['path']):
+            # Wide diagrams (process chains, timelines) need the slide's full width
+            used = self._text_wide_image_slides(number, name, text, images, notes)
+        else:
+            side = images[:SIDE_IMAGES_MAX] if self._side_fits(images[:SIDE_IMAGES_MAX], text) else images[:1]
+            self._text_image_slides(number, name, text, side, notes)
+            used = len(side)
+        if images[used:]:
+            self._gallery_slides(number, name, images[used:], notes)
+
+    def _text_wide_image_slides(self, number, name, text, images, notes):
+        """Text across the top, wide image(s) across the bottom. Returns how many images were placed."""
+        top_h = CONTENT_H - WIDE_IMAGE_ROOM  # the first slide's text must leave room for the image
+        if self.one_slide_per_section:
+            pages = [text]
+        elif text_height(text, CONTENT_W, READABLE_PT) <= min(TEXT_BUDGET, top_h):
+            pages = [text]
+        else:
+            first = split_blocks(text, CONTENT_W, min(TEXT_BUDGET, top_h))
+            pages = first[:1] + split_blocks([b for pg in first[1:] for b in pg], CONTENT_W, TEXT_BUDGET)
+        size = min(fit_size(pages[0], CONTENT_W, top_h) or MIN_BODY_PT, 20)
+        rest_size = page_size(pages[1:], CONTENT_W)
+        wide = [img for img in images[:2] if is_wide(img['path'])]
+        text_h = min(text_height(pages[0], CONTENT_W, size) + 0.15, top_h)
+        room = CONTENT_H - text_h - 0.15
+        placed = wide if len(wide) == 2 and room >= 3.0 else wide[:1]
+        for n, page in enumerate(pages):
+            slide = self._new_slide(notes)
+            self._chrome(slide, number, name if n == 0 else f'{name} (cont.)')
+            box = add_rich_text(slide, MARGIN, CONTENT_TOP + 0.05, CONTENT_W, text_h if n == 0 else CONTENT_H, page,
+                                size if n == 0 else rest_size)
+            if n == 0:
+                if not fit_size(page, CONTENT_W, top_h):
+                    _shrink_on_overflow(box)
+                slot_h = (room - GAP * (len(placed) - 1)) / len(placed)
+                for k, img in enumerate(placed):
+                    place_image(slide, img['path'], MARGIN, CONTENT_TOP + text_h + 0.15 + k * (slot_h + GAP),
+                                CONTENT_W, slot_h, img.get('caption', ''))
+        return len(placed)
 
     def _text_section(self, number, name, blocks, notes):
         layout = choose_layout(blocks)
@@ -705,7 +849,7 @@ def paginate_table(rows, width, height):
 # Layout selection
 # ============================================================
 def has_text(blocks):
-    return any(b['type'] in ('para', 'list', 'table') for b in blocks)
+    return any(b['type'] in ('para', 'quote', 'list', 'table') for b in blocks)
 
 
 def choose_layout(blocks):
@@ -715,9 +859,11 @@ def choose_layout(blocks):
     intro_chars = sum(len(plain(b['text'])) for b in paras)
     if 'table' in types:
         return 'table'
-    if 'sub' in types or len(lists) != 1:
+    if 'sub' in types or 'quote' in types or len(lists) != 1:
         return 'text'
     items = lists[0]['items']
+    if any(list_levels(lists[0])):
+        return 'text'  # nested sub-points need the indented list
     if intro_chars > 320:
         return 'text'
     if 2 <= len(items) <= 4 and all(extract_stat(i)[0] for i in items) and all(len(plain(i)) <= 110 for i in items):
@@ -800,6 +946,10 @@ def can_follow(group_numbers, number):
     return last == number - 1
 
 
+def is_chapter(blocks):
+    return bool(blocks) and blocks[0]['type'] == 'chapter'
+
+
 def pack_small_sections(sections):
     """
     Short consecutive sections ("01 Defence heritage", "02 Focused range"...) share a slide
@@ -811,7 +961,8 @@ def pack_small_sections(sections):
         if out:
             prev_name, prev_blocks = out[-1]
             joined = prev_blocks + [{'type': 'sub', 'text': name}] + list(blocks)
-            if (can_follow(numbers[-1], number) and section_height(blocks) <= TEXT_BUDGET * SMALL_SECTION
+            if (not is_chapter(blocks) and can_follow(numbers[-1], number)
+                    and section_height(blocks) <= TEXT_BUDGET * SMALL_SECTION
                     and not any(b['type'] == 'table' for b in joined)
                     and section_height(joined) <= TEXT_BUDGET * PACK_FILL):
                 out[-1] = (prev_name, joined)
@@ -887,10 +1038,11 @@ def split_long_sections(sections):
 def section_notes(name, blocks):
     lines = [name]
     for b in blocks:
-        if b['type'] in ('para', 'sub'):
+        if b['type'] in ('para', 'sub', 'quote'):
             lines.append(plain(b['text']))
         elif b['type'] == 'list':
-            lines.extend('- ' + plain(i) for i in b['items'])
+            lines.extend('   ' * level + (label or '-') + ' ' + plain(i)
+                         for i, label, level in zip(b['items'], list_labels(b), list_levels(b)))
         elif b['type'] == 'table':
             lines.extend(' | '.join(plain(c) for c in r) for r in b['rows'])
         elif b['type'] == 'image' and b.get('caption'):
@@ -954,27 +1106,45 @@ AGENDA_RANGE = (3, 14)
 def build_deck(title, sections, theme=DEFAULT_THEME, subtitle='Presentation', one_slide_per_section=False,
                agenda=True):
     """
-    Return a BytesIO containing the finished .pptx.
+    Return (BytesIO of the finished .pptx, slide count).
     sections: [(section_title, [blocks])] with image paths already resolved.
     """
-    global T
-    with _theme_lock:  # T is module state; keep concurrent builds from mixing themes
+    global T, TEXT_BUDGET
+    with _theme_lock:  # T and TEXT_BUDGET are module state; keep concurrent builds apart
         T = THEMES.get(theme, THEMES[DEFAULT_THEME])
         try:
-            builder = DeckBuilder(title, subtitle, one_slide_per_section)
-            sections = [(n, b) for n, b in sections if b] or \
-                [('Overview', [{'type': 'para', 'text': 'No content was found in this document.'}])]
-            if not one_slide_per_section:
-                sections = pack_small_sections(split_long_sections(sections))
-            builder.cover()
-            if agenda and AGENDA_RANGE[0] <= len(sections) <= AGENDA_RANGE[1]:
-                builder.agenda([n for n, _ in sections])
-            for i, (name, blocks) in enumerate(sections, start=1):
-                builder.section(i, name, blocks)
-            builder.closing()
+            builder = _build(title, sections, subtitle, one_slide_per_section, agenda)
+            if not one_slide_per_section and builder.page > DENSE_AFTER:
+                fill = min(MAX_TEXT_FILL, TEXT_FILL * builder.page / DENSE_AFTER)
+                TEXT_BUDGET = CONTENT_H * fill
+                builder = _build(title, sections, subtitle, one_slide_per_section, agenda)
             buffer = BytesIO()
             builder.prs.save(buffer)
             buffer.seek(0)
             return buffer, builder.page
         finally:
             T = THEMES[DEFAULT_THEME]
+            TEXT_BUDGET = CONTENT_H * TEXT_FILL
+
+
+def _build(title, sections, subtitle, one_slide_per_section, agenda):
+    builder = DeckBuilder(title, subtitle, one_slide_per_section)
+    sections = [(n, b) for n, b in sections if b] or \
+        [('Overview', [{'type': 'para', 'text': 'No content was found in this document.'}])]
+    if not one_slide_per_section:
+        sections = pack_small_sections(split_long_sections(sections))
+    chapters = [n for n, b in sections if is_chapter(b)]
+    builder.cover()
+    if agenda and len(chapters) >= 2:
+        builder.agenda(chapters[:20], 'chapters')
+    elif agenda and AGENDA_RANGE[0] <= len(sections) <= AGENDA_RANGE[1]:
+        builder.agenda([n for n, _ in sections])
+    chapter_no = 0
+    for i, (name, blocks) in enumerate(sections, start=1):
+        if is_chapter(blocks):
+            chapter_no += 1
+            builder.chapter(chapter_no, name)
+        # With chapters, the badge shows the chapter; otherwise the section's own number
+        builder.section(chapter_no if chapters else i, name, blocks)
+    builder.closing()
+    return builder
