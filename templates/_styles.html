@@ -208,6 +208,11 @@ code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .drop { min-height: 220px; }
   .nav { display: none; }
 }
+@media (max-width: 700px) {
+  /* phones: title, then straight to the converter */
+  .extras { display: none; }
+  .hero { min-height: 0; gap: 22px; }
+}
 @media (max-width: 560px) {
   .wrap { padding: 12px 12px 40px; }
   .card { padding: 20px; border-radius: 22px; }

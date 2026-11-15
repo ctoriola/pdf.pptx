@@ -54,6 +54,14 @@ THEMES = {
         ink='FFFFFF', body='D6D8DC', muted='9CA0A8', line='33363D', panel='1E2026',
         bg='131418', on_accent='FFFFFF', cover_bg='0B0B0D', cover_text='FFFFFF', cover_muted='A3A6AD',
         head_font='Arial', body_font='Arial'),
+    # Mint on black: the web app's own look. The mint is a fill (badges, table headers, cover
+    # shapes) with dark text on it; headings and labels on white use the deep green instead.
+    'mint': Theme(
+        'mint', 'Mint & Black',
+        accent='6FE7A2', accent_strong='1F4A2E', accent_soft='B9F3D0', tint='EAFBF1',
+        ink='0C0C0C', body='3D3D3D', muted='7A7A7A', line='E2E2E2', panel='F1F1F1',
+        bg='FFFFFF', on_accent='0B2A17', cover_bg='0C0C0C', cover_text='FFFFFF', cover_muted='A0A0A0',
+        head_font='Arial', body_font='Arial'),
 }
 CHAR_EM = {'Calibri': 0.47, 'Arial': 0.52}  # average character width (ems), for text fitting
 
@@ -276,7 +284,7 @@ def _bullet(paragraph, left_in=0.0, indent_in=0.3):
     pPr.set('indent', str(-Emu(Inches(indent_in))))
     _clear_bullets(pPr)
     clr = pPr.makeelement(qn('a:buClr'), {})
-    clr.append(clr.makeelement(qn('a:srgbClr'), {'val': _rgb_hex(T.accent)}))
+    clr.append(clr.makeelement(qn('a:srgbClr'), {'val': _rgb_hex(T.accent_strong)}))
     pPr.append(clr)
     pPr.append(pPr.makeelement(qn('a:buFont'), {'typeface': 'Arial'}))
     pPr.append(pPr.makeelement(qn('a:buChar'), {'char': '•'}))
@@ -434,6 +442,7 @@ def place_image(slide, path, x, y, w, h, caption=''):
     return True
 
 
+TAGLINE_PT = 17
 WIDE_ASPECT = 2.2
 WIDE_IMAGE_ROOM = 2.3  # inches kept for a wide image under the text
 
@@ -481,7 +490,7 @@ class DeckBuilder:
         size = 30 if len(title) <= 55 else 24 if len(title) <= 80 else 20
         kicker = self.kicker if not re.search(r'\((cont\.|figures|table)\)$', title) else ''
         if kicker:  # "01 / TACTICAL SHOTGUN" set small above the title
-            add_text(slide, MARGIN + offset, 0.38, CONTENT_W - offset, 0.3, kicker.upper(), 12, T.accent, bold=True)
+            add_text(slide, MARGIN + offset, 0.38, CONTENT_W - offset, 0.3, kicker.upper(), 12, T.accent_strong, bold=True)
         add_text(slide, MARGIN + offset, 0.62 if kicker else 0.5, CONTENT_W - offset, 0.85, title, size, T.ink,
                  bold=True, anchor=MSO_ANCHOR.MIDDLE, font=T.head_font)
         add_text(slide, MARGIN, 7.0, 8, 0.3, self.title, 10, T.muted)
@@ -586,7 +595,7 @@ class DeckBuilder:
         if images[used:]:
             self._gallery_slides(number, name, images[used:], notes)
 
-    def _product_slide(self, number, name, blocks, meta, notes):
+    def _product_slide(self, number, name, blocks, meta, notes):  # noqa: C901
         """
         One slide for one product: photo and price on the left; tagline, description and the
         spec sheet on the right. Returns False (so the ordinary flow is used) if it cannot fit.
@@ -603,7 +612,10 @@ class DeckBuilder:
         rows = table['rows']
         left_w, gap = 5.5, 0.45
         right_x, right_w = MARGIN + left_w + gap, CONTENT_W - left_w - gap
-        tag_h = 0.5 if meta.get('tagline') else 0.0
+        tag_h = 0.0
+        if meta.get('tagline'):  # one or two lines, depending on its length in this theme's font
+            per_line = max(10, int(right_w / (TAGLINE_PT * CHAR_EM.get(T.head_font, 0.52) * 1.08 / 72)))
+            tag_h = math.ceil(len(meta['tagline']) / per_line) * TAGLINE_PT * 1.2 / 72 + 0.2
         label_h = 0.32 if table.get('label') else 0.0
         # the largest spec-sheet size at which the description still fits above it at a readable size
         for spec_size, floor in ((16, 13), (15, 13), (14, 13), (13, 12), (12, 12), (11, 11), (10, 10)):
@@ -642,8 +654,8 @@ class DeckBuilder:
         # ---- right: tagline, description, spec sheet
         y = CONTENT_TOP
         if meta.get('tagline'):
-            add_text(slide, right_x, y, right_w, 0.45, meta['tagline'], 17, T.accent_strong, bold=True,
-                     font=T.head_font)
+            add_text(slide, right_x, y, right_w, tag_h - 0.1, meta['tagline'], TAGLINE_PT, T.accent_strong,
+                     bold=True, font=T.head_font)
             y += tag_h
         if desc:
             desc_h = text_height(desc, right_w, desc_size) + 0.05
@@ -682,7 +694,7 @@ class DeckBuilder:
         text_size = 15 if row_h >= 0.95 else 13
         text_w = col_w - badge - 0.3
         # one text size for every step: the largest at which the longest description fits
-        text_size = min([text_size] + [fit_size([{'type': 'para', 'text': i['text']}], text_w, row_h - 0.5, 11) or 11
+        text_size = min([text_size] + [fit_size([{'type': 'para', 'text': i['text']}], text_w, row_h - 0.5, 12) or 12
                                        for i in items])
         for n, item in enumerate(items):
             c, r = divmod(n, per_col)
