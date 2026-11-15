@@ -7,67 +7,134 @@
   {% include '_styles.html' %}
 </head>
 <body>
-<main class="wrap">
-  <header>
-    <h1>PDF to Slides</h1>
-    <p class="lede">Upload a PDF and get a ready-to-present PowerPoint deck. Text, tables and images are pulled from the document and laid out to fit each slide.</p>
+<div class="wrap">
+  <header class="bar">
+    <a class="brand" href="/">©PDF2SLIDES</a>
+    <nav class="nav" aria-label="Main">
+      <a href="/" aria-current="page">Convert</a>
+      <a href="#how">How it works</a>
+      <a href="/setup">Storage setup</a>
+    </nav>
+    <div class="bar-end">
+      <span class="pill">PDF to PowerPoint</span>
+      <span class="pill dark">Up to {{ max_upload_mb }} MB</span>
+    </div>
   </header>
 
-  <form id="form" class="card" enctype="multipart/form-data">
-    <label class="drop" id="drop">
-      <input type="file" name="pdf" id="pdf" accept="application/pdf,.pdf" required>
-      <span class="drop-title" id="drop-title">Choose a PDF or drop it here</span>
-      <span class="hint">Up to {{ max_upload_mb }} MB</span>
-    </label>
-
-    <fieldset>
-      <legend>Slide type</legend>
-      <div class="modes">
-        {% for key, plan in plans.items() %}
-        {% set disabled = plan.uses_llm and not llm_ready %}
-        <label class="mode{% if disabled %} disabled{% endif %}">
-          <input type="radio" name="mode" value="{{ key }}" {% if key == default_mode %}checked{% endif %} {% if disabled %}disabled{% endif %}>
-          <span class="mode-body">
-            <span class="mode-title">{{ plan.label }}{% if plan.uses_llm %} <span class="tag">AI</span>{% endif %}</span>
-            <span class="mode-desc">{{ plan.description }}</span>
-            {% if disabled %}<span class="mode-desc warn">Needs an AI key on the server (GROQ_API_KEY).</span>{% endif %}
-          </span>
-        </label>
-        {% endfor %}
+  <main class="bento">
+    <!-- hero -->
+    <section class="card black hero span-8">
+      <span class="pill ghost" style="align-self:flex-start">Presentation builder</span>
+      <div>
+        <h1 class="display">PDF to<br>Slides</h1>
+        <p class="lede">Upload a PDF and get a ready-to-present PowerPoint deck. Text, tables and images are pulled
+          from the document and laid out the way that kind of document should be presented.</p>
       </div>
-    </fieldset>
+      <div class="hero-art" aria-hidden="true"><span></span><span></span><span></span></div>
+      <a class="go" href="#form" aria-label="Go to the converter">↓</a>
+    </section>
 
-    <div class="row">
-      <label class="field">
-        <span>Theme</span>
-        <select name="theme">
-          {% for key, theme in themes.items() %}
-          <option value="{{ key }}" {% if key == default_theme %}selected{% endif %}>{{ theme.name }}</option>
-          {% endfor %}
-        </select>
-      </label>
-      <label class="field grow">
-        <span>Deck title <em>(optional)</em></span>
-        <input type="text" name="title" maxlength="120" placeholder="Uses the PDF's title if left blank">
-      </label>
-    </div>
-
-    <button type="submit" id="submit">Convert to slides</button>
-  </form>
-
-  <section id="progress" class="card" hidden>
-    <div class="spinner" id="spinner"></div>
-    <p id="message"></p>
-    <p class="hint" id="sub"></p>
-    <div id="result" hidden>
-      <div class="actions">
-        <a id="dl-pptx" class="button">Download .pptx again</a>
-        <button type="button" id="dl-md" class="button secondary">Download Markdown + images</button>
+    <div class="stack span-4">
+      <section class="card mint">
+        <p class="kicker">Reads the document first</p>
+        <p class="small">A brochure becomes product slides with prices and specs. A handbook becomes chapters,
+          steps and quizzes. A report keeps its tables.</p>
+      </section>
+      <div class="split">
+        <section class="card tile" style="padding:22px">
+          <div class="big">3</div>
+          <p class="small muted" style="margin-top:8px">slide types: condensed, standard, detailed</p>
+        </section>
+        <section class="card forest" style="padding:22px">
+          <p class="kicker" style="color:#fff">{% if llm_ready %}AI planner on{% else %}AI planner off{% endif %}</p>
+          <p class="small">{% if llm_ready %}Slide structure is reviewed by AI, with rules as the fallback.{% else %}Add an AI key on the server to plan structure and summarise with AI.{% endif %}</p>
+        </section>
       </div>
     </div>
-    <button type="button" id="again" class="link" hidden>Convert another PDF</button>
-  </section>
-</main>
+
+    <!-- converter -->
+    <form id="form" class="card span-12" enctype="multipart/form-data">
+      <div class="bento">
+        <div class="span-5">
+          <label class="drop" id="drop">
+            <input type="file" name="pdf" id="pdf" accept="application/pdf,.pdf" required>
+            <span class="plus" aria-hidden="true">+</span>
+            <span class="pill ghost">PDF</span>
+            <span class="drop-title" id="drop-title">Choose a PDF or drop it here</span>
+            <span class="hint">Up to {{ max_upload_mb }} MB</span>
+          </label>
+        </div>
+        <div class="span-7">
+          <fieldset>
+            <legend class="field-label">Slide type</legend>
+            <div class="modes">
+              {% for key, plan in plans.items() %}
+              {% set disabled = plan.uses_llm and not llm_ready %}
+              <label class="mode{% if disabled %} disabled{% endif %}">
+                <input type="radio" name="mode" value="{{ key }}" {% if key == default_mode %}checked{% endif %} {% if disabled %}disabled{% endif %}>
+                <span class="mode-body">
+                  <span class="mode-title">{{ plan.label }}{% if plan.uses_llm %} <span class="tag">AI</span>{% endif %}</span>
+                  <span class="mode-desc">{{ plan.description }}</span>
+                  {% if disabled %}<span class="mode-desc warn">Needs an AI key on the server (GROQ_API_KEY).</span>{% endif %}
+                </span>
+              </label>
+              {% endfor %}
+            </div>
+          </fieldset>
+
+          <div class="row">
+            <label class="field">
+              <span>Theme</span>
+              <select name="theme">
+                {% for key, theme in themes.items() %}
+                <option value="{{ key }}" {% if key == default_theme %}selected{% endif %}>{{ theme.name }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label class="field">
+              <span>Deck title <em>(optional)</em></span>
+              <input type="text" name="title" maxlength="120" placeholder="Uses the PDF's title if left blank">
+            </label>
+          </div>
+
+          <button type="submit" id="submit" class="submit">Convert to slides <span class="go" aria-hidden="true">→</span></button>
+        </div>
+      </div>
+    </form>
+
+    <section id="progress" class="card black span-12" hidden aria-live="polite">
+      <div class="spinner" id="spinner"></div>
+      <p id="message"></p>
+      <p class="hint" id="sub"></p>
+      <div id="result" hidden>
+        <div class="actions">
+          <a id="dl-pptx" class="button mint">Download .pptx again</a>
+          <button type="button" id="dl-md" class="button secondary">Download Markdown + images</button>
+        </div>
+      </div>
+      <button type="button" id="again" class="link" hidden style="align-self:flex-start">Convert another PDF</button>
+    </section>
+
+    <!-- how it works -->
+    <section class="card step mint span-4" id="how">
+      <span class="num">01</span>
+      <div><h3>Reads the PDF</h3><p class="small" style="margin-top:8px">Headings, lists, tables and pictures, each kept where it belongs.</p></div>
+    </section>
+    <section class="card step forest span-4">
+      <span class="num">02</span>
+      <div><h3>Plans the structure</h3><p class="small" style="margin-top:8px">Works out what each piece is: a product, a price, a process, a chapter.</p></div>
+    </section>
+    <section class="card step tile span-4">
+      <span class="num">03</span>
+      <div><h3>Builds the slides</h3><p class="small muted" style="margin-top:8px">A layout chosen for the content, sized to fit, ready to present.</p></div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>Your PDF is deleted as soon as the deck is built.</span>
+    <span>PDF to Slides</span>
+  </footer>
+</div>
 
 <script>
 (() => {

@@ -6,77 +6,98 @@
   <meta name="robots" content="noindex">
   <title>Storage Setup</title>
   {% include '_styles.html' %}
-  <style>
-    .checks { list-style: none; padding: 0; margin: 0 0 20px; }
-    .checks li { padding: 6px 0; border-bottom: 1px solid var(--line); display: flex; gap: 10px; }
-    .checks li:last-child { border-bottom: 0; }
-    .ok { color: #2c7a4b; font-weight: 700; }
-    .bad { color: var(--error); font-weight: 700; }
-    .field { margin-top: 16px; }
-    .field input { width: 100%; }
-    .result { margin-top: 20px; padding: 14px 16px; border-radius: 10px; background: var(--tint); color: var(--ink); }
-    .result.error { color: var(--error); }
-    code { font-size: .9em; }
-  </style>
 </head>
 <body>
-<main class="wrap">
-  <header>
-    <h1>Storage setup</h1>
-    <p class="lede">One-time setup for Backblaze B2 uploads. It lets browsers upload PDFs to your bucket and
-      deletes old files after about two days. Run it again any time; it only replaces this app's own rules.</p>
+<div class="wrap">
+  <header class="bar">
+    <a class="brand" href="/">©PDF2SLIDES</a>
+    <nav class="nav" aria-label="Main">
+      <a href="/">Convert</a>
+      <a href="/setup" aria-current="page">Storage setup</a>
+    </nav>
+    <div class="bar-end">
+      <span class="pill">Backblaze B2</span>
+      <span class="pill {{ 'mint' if ready else 'dark' }}">{{ 'Settings found' if ready else 'Settings missing' }}</span>
+    </div>
   </header>
 
-  <section class="card">
-    <h2 style="margin-top:0;color:var(--ink);font-size:1.1rem">Vercel settings</h2>
-    <ul class="checks">
-      {% for name, present in env_checks %}
-      <li><span class="{{ 'ok' if present else 'bad' }}">{{ '✓' if present else '✗' }}</span>
-        <code>{{ name }}</code>{% if not present %}&nbsp;is missing{% endif %}</li>
-      {% endfor %}
-    </ul>
-    {% if not ready %}
-    <p class="mode-desc warn">Add the missing settings in Vercel (Settings, then Environment Variables), redeploy,
-      then reload this page.</p>
-    {% else %}
-    <p class="mode-desc">Bucket: <strong>{{ bucket }}</strong></p>
-    <form method="post" autocomplete="off">
-      <label class="field">
-        <span>Master keyID</span>
-        <input type="text" name="key_id" required spellcheck="false">
-      </label>
-      <label class="field">
-        <span>Master applicationKey</span>
-        <input type="password" name="key" required spellcheck="false">
-      </label>
-      <label class="field">
-        <span>Only allow uploads from <em>(optional)</em></span>
-        <input type="text" name="origins" placeholder="https://your-app.vercel.app, https://another-domain.com"
-               spellcheck="false">
-      </label>
-      <p class="hint">The master key is used for this request only. It is not saved or logged.</p>
-      <button type="submit">Set up bucket</button>
-    </form>
+  <main class="bento">
+    <section class="card black hero span-7" style="min-height:300px">
+      <span class="pill ghost" style="align-self:flex-start">One-time setup</span>
+      <div>
+        <h1 class="title" style="font-size:clamp(34px,4.6vw,56px)">Storage<br>setup</h1>
+        <p class="lede">Lets browsers upload PDFs straight to your bucket and deletes old files after about two
+          days. Run it again any time; it only replaces this app's own rules.</p>
+      </div>
+    </section>
+
+    <section class="card span-5">
+      <span class="field-label">Vercel settings</span>
+      <ul class="checks">
+        {% for name, present in env_checks %}
+        <li><span class="dot {{ 'ok' if present else 'bad' }}">{{ '✓' if present else '✗' }}</span>
+          <code>{{ name }}</code>{% if not present %}&nbsp;is missing{% endif %}</li>
+        {% endfor %}
+      </ul>
+      {% if ready %}
+      <p class="small muted" style="margin-top:14px">Bucket: <strong style="color:var(--ink)">{{ bucket }}</strong></p>
+      {% else %}
+      <p class="small warn" style="margin-top:14px">Add the missing settings in Vercel (Settings, then Environment
+        Variables), redeploy, then reload this page.</p>
+      {% endif %}
+    </section>
+
+    {% if ready %}
+    <section class="card span-7">
+      <form method="post" autocomplete="off" class="form-grid">
+        <label class="field">
+          <span>Master keyID</span>
+          <input type="text" name="key_id" required spellcheck="false">
+        </label>
+        <label class="field">
+          <span>Master applicationKey</span>
+          <input type="password" name="key" required spellcheck="false">
+        </label>
+        <label class="field">
+          <span>Only allow uploads from <em>(optional)</em></span>
+          <input type="text" name="origins" placeholder="https://your-app.vercel.app, https://another-domain.com"
+                 spellcheck="false">
+        </label>
+        <button type="submit" class="submit" style="margin-top:4px">Set up bucket <span class="go" aria-hidden="true">→</span></button>
+      </form>
+    </section>
+
+    <div class="stack span-5">
+      <section class="card mint">
+        <p class="kicker">The master key is not kept</p>
+        <p class="small">It is used for this one request to set the bucket's rules. It is not saved or logged.</p>
+      </section>
+      <section class="card tile">
+        <p class="kicker">Where to find it</p>
+        <p class="small muted">Backblaze, Application Keys, Master Application Key. Generate a new one, paste both
+          values here, and you can generate another afterwards to cancel it.</p>
+      </section>
+    </div>
     {% endif %}
 
     {% if result %}
-    <div class="result{{ ' error' if result.error }}">
+    <section class="card span-12 {{ 'result error' if result.error else 'forest' }}">
       {% if result.error %}
         {{ result.error }}
       {% else %}
-        <strong>Bucket "{{ result.bucket }}" is ready.</strong><br>
-        Uploads allowed from: {{ result.origins | join(', ') }}<br>
-        Auto-delete: uploads/ and outputs/ after about 2 days<br>
+        <h3 class="title" style="color:#fff;font-size:30px">Bucket "{{ result.bucket }}" is ready.</h3>
+        <p class="small" style="margin-top:12px">Uploads allowed from: {{ result.origins | join(', ') }}<br>
+          Auto-delete: uploads/ and outputs/ after about 2 days</p>
         {% if result.app_key_problem %}
-          <span class="bad">App key check failed:</span> {{ result.app_key_problem }}
+          <p class="small" style="margin-top:12px;color:#ffd0cb"><strong>App key check failed:</strong> {{ result.app_key_problem }}</p>
         {% else %}
-          <span class="ok">✓</span> App key can write and delete files.<br>
-          <a href="/">Go to the converter</a>. The upload box should say "Up to {{ max_mb }} MB".
+          <p class="small" style="margin-top:12px">✓ App key can write and delete files.
+            <a href="/">Go to the converter</a>. The upload box should say "Up to {{ max_mb }} MB".</p>
         {% endif %}
       {% endif %}
-    </div>
+    </section>
     {% endif %}
-  </section>
-</main>
+  </main>
+</div>
 </body>
 </html>
