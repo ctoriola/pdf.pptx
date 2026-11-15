@@ -3,6 +3,7 @@ Tests for everything after Docling: Markdown parsing, image filtering, section h
 LLM plumbing (with the HTTP call stubbed out) and deck building for every slide type.
 """
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -1141,4 +1142,103 @@ def test_ai_modes_leave_product_and_process_slides_alone(brochure_md, monkeypatc
         buffer, _, _ = build_from_markdown(brochure_md, mode)
         text = ' '.join(sh.text_frame.text for s in Presentation(buffer).slides for sh in s.shapes if sh.has_text_frame)
         assert '₦400,000' in text and 'TECHNICAL DATA' in text and 'Submit documentation' in text
-    assert not any('TR-5 is a rugged' in call for call in fake.calls)  # the product copy was never sent for rewriting
+    rewrites = [c for c in fake.calls if 'Summarise the text' in c or 'Expand the text' in c]
+    assert not any('TR-5 is a rugged' in call for call in rewrites)  # the product copy was never sent for rewriting
+
+
+# ---------- the AI planner (LLM stubbed): validated suggestions, rules as the fallback ----------
+import planner  # noqa: E402
+
+HARD_BROCHURE_MD = re.sub(r'\n\*\*\d\*\*\n', '\n', BROCHURE_MD).replace('### Technical Data', '## Technical Data')
+
+
+@pytest.fixture
+def hard_sections(tmp_path):
+    """A brochure the rules cannot fully resolve: no step numbers, the spec table as its own section."""
+    (tmp_path / 'images').mkdir()
+    shutil.copy(FIXTURES / 'images' / 'photo2.png', tmp_path / 'images' / 'photo2.png')
+    md = tmp_path / 'document.md'
+    md.write_text(HARD_BROCHURE_MD)
+    return semantics.structure(load_sections(md)[1])
+
+
+def test_rules_alone_leave_the_hard_brochure_fragmented(hard_sections):
+    assert [n for n, _ in hard_sections] == ['TR-5', 'Technical Data', 'How to order']
+    assert not any(semantics.layout_of(b) for _, b in hard_sections)
+
+
+def test_planner_merges_fragments_and_promotes_layouts(hard_sections):
+    plan = {'kind': 'brochure', 'sections': [{'id': 0, 'layout': 'product'}, {'id': 1, 'merge_into_previous': True},
+                                             {'id': 2, 'layout': 'steps'}]}
+    kind, sections, changes = planner.apply_plan(plan, hard_sections, 'document')
+    assert kind == 'brochure' and changes >= 2
+    layouts = {n: semantics.layout_of(b) for n, b in sections}
+    assert layouts['TR-5'] == 'product' and layouts['How to order'] == 'steps' and 'Technical Data' not in layouts
+    product = dict(sections)['TR-5']
+    assert any(b['type'] == 'price' for b in product) and next(b for b in product if b['type'] == 'table')['kv']
+    assert planner._total_words(sections) >= planner._total_words(hard_sections) * 0.95  # nothing lost
+
+
+def test_planner_suggestions_that_cannot_be_carried_out_are_ignored():
+    sections = [('Overview', [{'type': 'para', 'text': 'Plain text about first aid kits and gloves.'}]),
+                ('Details', [{'type': 'para', 'text': 'More plain text about bandages.'}]),
+                ('Care', [{'type': 'para', 'text': 'Text.'}])]
+    plan = {'kind': 'spaceship', 'sections': [
+        {'id': 0, 'layout': 'product'},                 # no picture, no spec sheet
+        {'id': 1, 'layout': 'steps'},                   # no step headings
+        {'id': 2, 'title': 'Completely Invented Marketing Headline'},   # 'Care' is not generic
+        {'id': 0, 'title': 'Quantum Blockchain Synergy'},               # generic title, but invented words
+        {'id': 99, 'layout': 'steps'}, 'nonsense', {'id': 'x'}]}
+    kind, out, changes = planner.apply_plan(plan, sections, 'document')
+    assert (kind, out, changes) == ('document', sections, 0)
+    kind, out, changes = planner.apply_plan({'sections': [{'id': 0, 'title': 'First Aid Kits and Gloves'}]}, sections, 'document')
+    assert out[0][0] == 'First Aid Kits and Gloves' and changes == 1  # generic title, the section's own words
+    merged_all = {'sections': [{'id': 1, 'merge_into_previous': True}, {'id': 2, 'merge_into_previous': True}]}
+    assert planner.apply_plan(merged_all, sections, 'document')[1] == sections  # merging most sections: not trusted
+    assert planner.apply_plan(['not', 'a', 'dict'], sections, 'document') == ('document', sections, 0)
+
+
+def test_planner_falls_back_to_rules_when_the_llm_fails(hard_sections, monkeypatch):
+    monkeypatch.setenv('GROQ_API_KEY', 'test')
+
+    def boom(*a, **k):
+        raise condense.LLMError('The AI service is busy (rate limit).')
+    monkeypatch.setattr(condense, 'chat_json', boom)
+    assert planner.refine('T', {'pages': 5}, hard_sections, 'brochure') == ('brochure', hard_sections, 'rules')
+    # a plan that would lose content is rejected as a whole
+    monkeypatch.setattr(condense, 'chat_json', lambda *a, **k: {'kind': 'brochure', 'sections': []})
+    monkeypatch.setattr(planner, 'apply_plan', lambda plan, s, k: (k, s[:1], 1))
+    assert planner.refine('T', {'pages': 5}, hard_sections, 'brochure')[2] == 'rules'
+    monkeypatch.undo()
+    monkeypatch.delenv('GROQ_API_KEY', raising=False)
+    monkeypatch.delenv('LLM_API_KEY', raising=False)
+    assert planner.refine('T', {'pages': 5}, hard_sections, 'brochure')[2] == 'rules'  # no key: rules, no request
+
+
+def test_standard_mode_uses_the_planner_when_a_key_is_set(tmp_path, monkeypatch):
+    (tmp_path / 'images').mkdir()
+    shutil.copy(FIXTURES / 'images' / 'photo2.png', tmp_path / 'images' / 'photo2.png')
+    md = tmp_path / 'document.md'
+    md.write_text(HARD_BROCHURE_MD)
+    monkeypatch.setenv('GROQ_API_KEY', 'test')
+    seen = []
+
+    def fake(system, user, max_tokens=1500, retries=5):
+        seen.append(user)
+        return {'kind': 'brochure', 'sections': [{'id': 0, 'layout': 'product'}, {'id': 1, 'merge_into_previous': True},
+                                                 {'id': 2, 'layout': 'steps'}]}
+    monkeypatch.setattr(condense, 'chat_json', fake)
+    buffer, _, slides = build_from_markdown(md, 'standard')
+    assert slides == 5 and json.loads((tmp_path / 'plan.json').read_text()) == {'kind': 'brochure', 'planner': 'ai'}
+    outline = seen[0]
+    assert '"TR-5"' in outline and 'table 4x2 (label/value)' in outline
+    assert 'sealed housing and simple controls' not in outline  # an outline, not the document's full text
+    monkeypatch.setattr(condense, 'chat_json', lambda *a, **k: (_ for _ in ()).throw(condense.LLMError('down')))
+    buffer, _, slides = build_from_markdown(md, 'standard')
+    assert slides >= 5 and json.loads((tmp_path / 'plan.json').read_text())['planner'] == 'rules'  # still a deck
+
+
+def test_app_reports_how_the_deck_was_planned(client):
+    with open(SAMPLE_PDF, 'rb') as f:
+        res = client.post('/convert', data={'pdf': (f, 'sample.pdf'), 'mode': 'standard'})
+    assert res.status_code == 200 and res.headers['X-Planner'] == 'rules' and res.headers['X-Kind'] in planner.KINDS

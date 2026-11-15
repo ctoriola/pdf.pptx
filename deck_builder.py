@@ -681,15 +681,16 @@ class DeckBuilder:
         title_size = 20 if row_h >= 0.95 else 17
         text_size = 15 if row_h >= 0.95 else 13
         text_w = col_w - badge - 0.3
+        # one text size for every step: the largest at which the longest description fits
+        text_size = min([text_size] + [fit_size([{'type': 'para', 'text': i['text']}], text_w, row_h - 0.5, 11) or 11
+                                       for i in items])
         for n, item in enumerate(items):
             c, r = divmod(n, per_col)
             x, y = MARGIN + c * (col_w + GAP), top + r * row_h
             number_badge(slide, x, y + 0.05, badge, str(n + 1), size=badge * 28)
             add_text(slide, x + badge + 0.3, y, text_w, 0.4, plain(item['title']), title_size, T.ink, bold=True,
                      font=T.head_font)
-            body = [{'type': 'para', 'text': item['text']}]
-            size = fit_size(body, text_w, row_h - 0.5, 11) or 11
-            add_text(slide, x + badge + 0.3, y + 0.42, text_w, row_h - 0.48, item['text'], min(size, text_size),
+            add_text(slide, x + badge + 0.3, y + 0.42, text_w, row_h - 0.48, item['text'], text_size,
                      T.body, markdown=True, line_spacing=1.05)
         return True
 

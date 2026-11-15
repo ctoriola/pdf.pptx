@@ -3,11 +3,13 @@ End-to-end conversion: PDF -> Markdown (+images) -> sections -> [LLM] -> .pptx
 
     convert(pdf_path, work_dir, mode='standard', theme='coral', title=None, progress=print)
 """
+import json
 import logging
 import re
 from pathlib import Path
 
 import condense
+import planner
 import semantics
 import text_repair
 from deck_builder import build_deck
@@ -97,6 +99,12 @@ def build_from_markdown(md_path, mode='standard', theme='coral', title=None, pdf
     doc_meta = semantics.read_doc_meta(Path(md_path).read_text(encoding='utf-8'))
     sections = semantics.structure(sections)
     kind = semantics.classify(doc_meta, sections)
+    # With an LLM available, let it review the arrangement; on any failure the rules' plan stands
+    kind, sections, planned_by = planner.refine(title, doc_meta, sections, kind, progress)
+    try:  # a small record of how the deck was planned, for the app to report
+        (Path(md_path).parent / 'plan.json').write_text(json.dumps({'kind': kind, 'planner': planned_by}))
+    except OSError:
+        pass
     log.info('%s: %d sections, %d words', title, len(sections), sum(word_count(b) for _, b in sections))
 
     if plan['mode'] == 'condensed':

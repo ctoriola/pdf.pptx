@@ -109,7 +109,7 @@
 
   // The server does everything in one request; show where it probably is
   function startTicker(usesLlm) {
-    const steps = ['Reading the PDF (layout, text, tables and images)…', 'Splitting the text into slides…']
+    const steps = ['Reading the PDF (layout, text, tables and images)…', 'Planning the slide structure…']
       .concat(usesLlm ? ['Asking the AI to rewrite each section…', 'Still writing. Long documents take a minute or two…'] : [])
       .concat(['Building slides…']);
     let i = 0;
@@ -142,6 +142,12 @@
 
   let markdownUrl = null;
 
+  // "· brochure layout, planned with AI": what the document was read as, and who arranged it
+  function planNote(kind, planner) {
+    if (!kind) return '';
+    return ` · ${kind} layout, planned ${planner === 'ai' ? 'with AI' : 'by rules'}`;
+  }
+
   function triggerDownload(url) {
     const a = document.createElement('a');
     a.href = url;
@@ -166,7 +172,8 @@
     triggerDownload(data.download_url);
     dlPptx.href = data.download_url; dlPptx.removeAttribute('download');
     markdownUrl = data.markdown_url || null;
-    show('done', 'Your slides are ready and downloading.', `${data.title} · ${data.slides} slides · links work for 1 hour`);
+    show('done', 'Your slides are ready and downloading.',
+         `${data.title} · ${data.slides} slides${planNote(data.kind, data.planner)} · links work for 1 hour`);
     result.hidden = false;
   }
 
@@ -180,7 +187,8 @@
     dlPptx.href = url; dlPptx.download = name;
     markdownUrl = null;
     show('done', 'Your slides are ready and downloading.',
-         `${res.headers.get('X-Title') || name} · ${res.headers.get('X-Slides') || '?'} slides`);
+         `${res.headers.get('X-Title') || name} · ${res.headers.get('X-Slides') || '?'} slides` +
+         planNote(res.headers.get('X-Kind'), res.headers.get('X-Planner')));
     result.hidden = false;
   }
 

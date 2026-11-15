@@ -12,6 +12,7 @@ Two upload routes:
     On Vercel this is capped at 4.5 MB each way.
 """
 import io
+import json
 import logging
 import os
 import tempfile
@@ -144,7 +145,7 @@ def _deliver(local_path, download_name, mimetype, ctx, extra=None):
     resp = send_file(out, as_attachment=True, download_name=download_name, mimetype=mimetype)
     for key, value in extra.items():
         resp.headers[f'X-{key.title()}'] = str(value).encode('ascii', 'ignore').decode()
-    resp.headers['Access-Control-Expose-Headers'] = 'X-Title, X-Slides, Content-Disposition'
+    resp.headers['Access-Control-Expose-Headers'] = 'X-Title, X-Slides, X-Kind, X-Planner, Content-Disposition'
     return resp
 
 
@@ -167,6 +168,10 @@ def convert_route():
             pptx_path, md_path, deck_title, slide_total = convert(pdf_path, work, mode, theme, title,
                                                                   source_name=filename)
             extra = {'title': deck_title, 'slides': slide_total}
+            try:  # how the deck was planned: the document kind, and whether AI or the rules arranged it
+                extra.update(json.loads((md_path.parent / 'plan.json').read_text()))
+            except (OSError, ValueError):
+                pass
             if ctx:
                 # The PDF is deleted after this request, so hand back the Markdown link now too
                 zip_path = _zip_markdown(md_path, Path(work) / (pptx_path.stem + '_markdown.zip'))
