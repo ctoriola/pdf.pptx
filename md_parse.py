@@ -336,6 +336,8 @@ def word_count(blocks):
             n += sum(len(i.split()) for i in b['items'])
         elif b['type'] == 'table':
             n += sum(len(c.split()) for r in b['rows'] for c in r)
+        elif b['type'] == 'steps':
+            n += sum(len(i['title'].split()) + len(i['text'].split()) for i in b['items'])
     return n
 
 
@@ -358,4 +360,9 @@ def blocks_to_markdown(blocks):
             out.append('\n'.join(lines))
         elif b['type'] == 'image' and b.get('caption'):
             out.append(f'[Figure: {b["caption"]}]')
+        elif b['type'] == 'price':
+            out.append(' '.join(x for x in (f'{b.get("label") or "Price"}:', b['amount'], b.get('unit'),
+                                            f'({b["note"]})' if b.get('note') else '') if x))
+        elif b['type'] == 'steps':
+            out.append('\n'.join(f'{n}. {i["title"]}: {i["text"]}' for n, i in enumerate(b['items'], 1)))
     return '\n\n'.join(out)

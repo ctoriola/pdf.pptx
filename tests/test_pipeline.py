@@ -764,7 +764,7 @@ def test_chapters_and_title_are_read_from_font_sizes():
 
 def test_front_matter_is_dropped_and_chapters_marked(tmp_path):
     text = pdf_to_md.convert_pdf(HANDBOOK, tmp_path).read_text()
-    assert text.startswith('# FAH First Aid Handbook')
+    assert text.startswith('<!-- pdf2pptx {"pages": 7, "chapters": 2') and '\n# FAH First Aid Handbook\n' in text
     assert 'All rights reserved' not in text and 'CONTENTS' not in text.upper() and '. . . .' not in text
     assert '## General Concepts of First Aid {.chapter}' in text
     assert '## Care for Adults (18 and Over) {.chapter}' in text
@@ -977,3 +977,168 @@ def test_retired_model_falls_through_to_the_next(monkeypatch):
 
 def test_json_wrapped_in_prose_is_still_read():
     assert condense._parse_json('Here you go:\n```json\n{"a": 1}\n```') == {'a': 1}
+
+
+# ---------- the meaning layer: products, prices, processes ----------
+import semantics  # noqa: E402
+
+BROCHURE_MD = '''<!-- pdf2pptx {"pages": 5, "chapters": 0, "subtitle": "Field radios and accessories for licensed operators.", "kicker": "PRODUCT BROCHURE | 2026"} -->
+
+# Field Radios & Accessories
+
+### 01 / Handheld Radio
+
+## TR-5
+
+Rugged handheld radio with long-life battery
+
+![](images/photo2.png)
+
+The TR-5 is a rugged handheld radio built for security teams. It pairs a long-life battery with a sealed housing and simple controls.
+
+### Technical Data
+
+|Model|**Handheld, sealed**|
+|---|---|
+|Range|**8 km**|
+|Battery|**18 hours**|
+|Weight|**310 g**|
+
+PRICE
+
+₦ 400,000 per unit
+
+Exclusive of VAT and applicable taxes
+
+**Documentation required:** a valid operator licence before an invoice is issued.
+
+## How to order
+
+### Send an enquiry
+
+**1**
+
+Tell us the products and quantities you need.
+
+**2**
+
+### Submit documentation
+
+Provide a valid operator licence.
+
+### Receive your invoice
+
+**3**
+
+Once documents are approved, an invoice is issued.
+
+### Price Summary
+
+|TR-5 Handheld Radio|**₦400,000 / unit**|
+|---|---|
+|Spare battery|**₦35,000 / piece**|
+
+Prices are exclusive of VAT. Quotations are valid for 30 days.
+'''
+
+
+@pytest.fixture
+def brochure_md(tmp_path):
+    (tmp_path / 'images').mkdir()
+    shutil.copy(FIXTURES / 'images' / 'photo2.png', tmp_path / 'images' / 'photo2.png')
+    md = tmp_path / 'document.md'
+    md.write_text(BROCHURE_MD)
+    return md
+
+
+def test_brochure_pieces_are_recognised(brochure_md):
+    _, sections = load_sections(brochure_md)
+    doc_meta = semantics.read_doc_meta(brochure_md.read_text())
+    structured = semantics.structure(sections)
+    assert semantics.classify(doc_meta, structured) == 'brochure'
+    assert [n for n, _ in structured] == ['TR-5', 'How to order', 'Price Summary']
+    product = dict(structured)['TR-5']
+    meta = semantics.get_meta(product)
+    assert meta['layout'] == 'product' and meta['kicker'] == '01 / Handheld Radio'
+    assert meta['tagline'] == 'Rugged handheld radio with long-life battery'
+    price = next(b for b in product if b['type'] == 'price')
+    assert (price['amount'], price['unit'], price['note']) == ('₦400,000', 'per unit', 'Exclusive of VAT and applicable taxes')
+    table = next(b for b in product if b['type'] == 'table')
+    assert table['kv'] and table['label'] == 'Technical Data'
+    steps = next(b for b in dict(structured)['How to order'] if b['type'] == 'steps')
+    assert [i['title'] for i in steps['items']] == ['Send an enquiry', 'Submit documentation', 'Receive your invoice']
+    assert not any(b['type'] == 'para' and b['text'].strip('*') in '123' for _, bl in structured for b in bl)
+
+
+def test_brochure_deck_is_one_slide_per_unit(brochure_md):
+    buffer, title, slides = build_from_markdown(brochure_md, 'standard')
+    prs = Presentation(buffer)
+    texts = [' | '.join(sh.text_frame.text for sh in s.shapes if sh.has_text_frame) for s in prs.slides]
+    assert slides == 5  # cover, product, process, price summary, closing: no agenda for a short brochure
+    assert 'PRODUCT BROCHURE | 2026' in texts[0] and 'Field radios and accessories' in texts[0]
+    product = next(t for t in texts if 'TR-5' in t and '₦400,000' in t)
+    for piece in ('01 / HANDHELD RADIO', 'Rugged handheld radio', 'TECHNICAL DATA', 'per unit', 'Documentation required'):
+        assert piece in product
+    product_slide = prs.slides[texts.index(product)]
+    assert any(sh.shape_type == 13 for sh in product_slide.shapes) and any(sh.has_table for sh in product_slide.shapes)
+    spec = next(sh.table for sh in product_slide.shapes if sh.has_table)
+    assert spec.cell(0, 0).text == 'Model' and not spec.first_row  # a spec sheet: no header row styling
+    process = next(t for t in texts if 'How to order' in t)
+    assert all(step in process for step in ('Send an enquiry', 'Submit documentation', 'Receive your invoice'))
+    assert_on_slide(prs)
+
+
+def test_prose_documents_are_not_mistaken_for_brochures():
+    _, sections = load_sections(SAMPLE)
+    structured = semantics.structure(sections)
+    assert semantics.classify({'pages': 40, 'chapters': 0}, structured) == 'document'
+    assert semantics.classify({'pages': 40, 'chapters': 5}, structured) == 'handbook'
+    assert not any(semantics.layout_of(b) for _, b in structured)
+    # ordinary sub-headings with a paragraph each are not a numbered process
+    blocks = parse_blocks('### Be Safe\n\nMake sure the scene is safe.\n\n### Call EMS\n\nSend someone.\n\n### CPR\n\nBegin.')
+    assert semantics.find_steps(blocks) == blocks
+
+
+def test_price_boxes_survive_picture_text_stripping():
+    page = ('![](img/p-11.png)\n\n<!-- Start of picture text -->\nPRICE<br><!-- End of picture text -->\n\n'
+            '![](img/p-12.png)\n\n<!-- Start of picture text -->\n₦ 4,000,000<br>per unit<br><!-- End of picture text -->\n\n'
+            '![](img/fig.png)\n\n<!-- Start of picture text -->\nA B C<br>D E F<br><!-- End of picture text -->\n')
+    out = pdf_structure.strip_picture_text(page)
+    assert 'PRICE' in out and '₦ 4,000,000 per unit' in out   # real content drawn as a box: kept as text
+    assert 'p-11.png' not in out and 'p-12.png' not in out      # ...and the pictures of those boxes dropped
+    assert 'fig.png' in out and 'A B C' not in out              # a figure keeps its image, loses its labels
+
+
+def test_cover_tagline_and_label_are_kept():
+    cover = '**E I G E R** S E C U R I T Y\n\n**PRODUCT BROCHURE | 2026**\n\n# **Tactical Kit**\n\nPlatforms and accessories for licensed security and military clients.'
+    assert pdf_structure.cover_extras(cover, 'Tactical Kit') == (
+        'Platforms and accessories for licensed security and military clients.', 'PRODUCT BROCHURE | 2026')
+
+
+def test_missed_images_are_recovered(tmp_path):
+    """A picture the layout model did not mark is rendered and referenced at its reading position."""
+    import pymupdf
+    doc = pymupdf.open()
+    page = doc.new_page()
+    page.insert_image(pymupdf.Rect(60, 200, 500, 420), filename=str(FIXTURES / 'images' / 'photo2.png'))
+    chunks = [{'text': 'HEADING\n\nBody text.', 'page_boxes': [
+        {'class': 'section-header', 'bbox': (60, 100, 300, 130), 'pos': (0, 7)},
+        {'class': 'text', 'bbox': (60, 500, 500, 520), 'pos': (9, 19)}]}]
+    pdf_structure.recover_missed_images(doc, chunks, str(tmp_path))
+    text = chunks[0]['text']
+    assert text.index('HEADING') < text.index('![](') < text.index('Body text.')
+    assert (tmp_path / 'missed-0001-00.png').is_file()
+    # a region the model already captured as a picture or table is left alone
+    seen = [{'text': 'x', 'page_boxes': [{'class': 'table', 'bbox': (60, 200, 500, 420), 'pos': (0, 1)}]}]
+    assert '![](' not in pdf_structure.recover_missed_images(doc, seen, str(tmp_path))[0]['text']
+
+
+def test_ai_modes_leave_product_and_process_slides_alone(brochure_md, monkeypatch):
+    fake = FakeLLM()
+    monkeypatch.setattr(condense, 'chat_json', fake)
+    monkeypatch.setenv('GROQ_API_KEY', 'test')
+    for mode in ('condensed', 'detailed'):
+        buffer, _, _ = build_from_markdown(brochure_md, mode)
+        text = ' '.join(sh.text_frame.text for s in Presentation(buffer).slides for sh in s.shapes if sh.has_text_frame)
+        assert '₦400,000' in text and 'TECHNICAL DATA' in text and 'Submit documentation' in text
+    assert not any('TR-5 is a rugged' in call for call in fake.calls)  # the product copy was never sent for rewriting

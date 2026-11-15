@@ -318,11 +318,39 @@ def _largest_images(images, n):
     return [img for img in images if img in keep]  # preserve document order
 
 
+def _is_designed(blocks):
+    """A product or process section: already slide-sized structured content, not prose to rewrite."""
+    return any(b['type'] == 'meta' and b.get('layout') for b in blocks[:2])
+
+
+def _group_prose_runs(sections, max_groups):
+    """Group prose sections as before, keeping each designed section as a group of its own."""
+    prose_total = sum(1 for _, b in sections if not _is_designed(b)) or 1
+    budget = max(1, max_groups - sum(1 for _, b in sections if _is_designed(b)))
+    groups, run = [], []
+
+    def flush():
+        if run:
+            groups.extend(group_sections(run, max(1, round(budget * len(run) / prose_total))))
+            run.clear()
+    for section in sections:
+        if _is_designed(section[1]):
+            flush()
+            groups.append([section])
+        else:
+            run.append(section)
+    flush()
+    return groups
+
+
 def condense_sections(doc_title, sections, plan, progress=None):
     progress = progress or (lambda msg: None)
-    groups = group_sections(sections, plan['max_sections'])
+    groups = _group_prose_runs(sections, plan['max_sections'])
     out = []
     for n, group in enumerate(groups, 1):
+        if len(group) == 1 and _is_designed(group[0][1]):
+            out.append(group[0])  # a product or process slide stays exactly as it is
+            continue
         progress(f'Summarising section {n} of {len(groups)}…')
         heading = ' / '.join(name for name, _ in group)
         text_blocks, images = [], []
@@ -345,10 +373,13 @@ def expand_sections(doc_title, sections, plan, progress=None):
     progress = progress or (lambda msg: None)
     out = []
     for n, (name, blocks) in enumerate(sections, 1):
+        if _is_designed(blocks):
+            out.append((name, blocks))  # a product or process slide stays exactly as it is
+            continue
         progress(f'Expanding section {n} of {len(sections)}…')
         # Tables and captions go to the LLM (so it can explain them); tables and images are re-attached verbatim
         text_blocks = blocks
-        kept = [b for b in blocks if b['type'] in ('image', 'table')]
+        kept = [b for b in blocks if b['type'] in ('image', 'table', 'price', 'steps')]
         words = word_count([b for b in text_blocks if b['type'] != 'table'])
         if words < 12:
             out.append((name, blocks))

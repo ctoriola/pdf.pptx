@@ -108,6 +108,10 @@ def repair_sections(title, sections, progress=None):
                 strings += [c for row in b['rows'] for c in row]
             elif b['type'] == 'image':
                 strings.append(b.get('caption', ''))
+            elif b['type'] == 'steps':
+                strings += [i['title'] for i in b['items']] + [i['text'] for i in b['items']]
+            elif b['type'] == 'meta':
+                strings += [b.get('kicker', ''), b.get('tagline', '')]
     fixes = repair_strings(strings, progress)
     if not fixes:
         return title, sections
@@ -126,6 +130,10 @@ def repair_sections(title, sections, progress=None):
                 b['rows'] = [[fix(c) for c in row] for row in b['rows']]
             elif b['type'] == 'image':
                 b['caption'] = fix(b.get('caption', ''))
+            elif b['type'] == 'steps':
+                b['items'] = [{'title': fix(i['title']), 'text': fix(i['text'])} for i in b['items']]
+            elif b['type'] == 'meta':
+                b = {**b, **{k: fix(b[k]) for k in ('kicker', 'tagline') if b.get(k)}}
             new_blocks.append(b)
         out.append((fix(name), new_blocks))
     return fix(title) if title else title, out

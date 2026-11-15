@@ -84,7 +84,7 @@ def analyze(doc):
             if not text.isupper():  # acronyms are capitals that appear inside normal sentences
                 caps_words.update(re.findall(r'\b[A-Z][A-Z0-9]{1,5}\b', text))
     if not sizes:
-        return {'body_size': 0, 'chapters': {}, 'cover_title': '', 'acronyms': set()}
+        return {'body_size': 0, 'chapters': {}, 'cover_title': '', 'acronyms': set(), 'page_titles': {}}
     body = sizes.most_common(1)[0][0]
 
     def display(text, size):
@@ -151,7 +151,20 @@ def analyze(doc):
         if n == 0 or (cover_words and set(_words(chapters[n])) <= cover_words):
             del chapters[n]
     acronyms = {w for w, c in caps_words.items() if c >= 2}
-    return {'body_size': body, 'chapters': chapters, 'cover_title': cover_title, 'acronyms': acronyms}
+    # Each page's main heading: its largest display line(s), when one size clearly leads
+    page_titles = {}
+    for n, lines in enumerate(per_page):
+        # (short product names count here: "MS-5" has only two letters)
+        big = [(size, text) for text, size, _ in lines
+               if size >= body * DISPLAY_RATIO and re.search(r'[A-Za-z]', text) and len(text.strip()) >= 2
+               and not MONEY_RE.search(text)]
+        if big:
+            top = max(size for size, _ in big)
+            title = _join_lines([text for size, text in big if size >= top * 0.92])
+            if 2 <= len(title) <= 90 and not MONEY_RE.search(title):
+                page_titles[n] = title
+    return {'body_size': body, 'chapters': chapters, 'cover_title': cover_title, 'acronyms': acronyms,
+            'page_titles': page_titles}
 
 
 def smart_title(text, acronyms=()):
@@ -177,8 +190,60 @@ def smart_title(text, acronyms=()):
 # ============================================================
 # Page clean-up
 # ============================================================
+MONEY_RE = re.compile(r'(?:[₦$€£¥₹]|\b(?:NGN|USD|EUR|GBP|KES|GHS|ZAR)\b)\s?\d[\d,.]*|\b\d[\d,.]*\s?(?:NGN|USD|EUR|GBP|naira|dollars)\b', re.I)
+PRICE_LABEL_RE = re.compile(r'^\W*(price|pricing|cost|fee|from|starting at|only)\W*$', re.I)
+IMAGE_LINE_RE = re.compile(r'^\s*!\[[^\]]*\]\([^)]*\)\s*$')
+
+
 def strip_picture_text(text):
-    return PICTURE_TEXT_RE.sub('', text)
+    """
+    Remove the text the converter found inside pictures: it repeats what the image shows
+    (diagram labels, "A B C" photo tags). The exception is a text box drawn as artwork that
+    carries real content, which no image can replace: a price panel ("PRICE", "₦4,000,000 per
+    unit"). That text is kept as a paragraph and the picture of the box is dropped instead.
+    """
+    lines = text.split('\n')
+
+    def repl(m):
+        inner = re.sub(r'<!--.*?-->|\*\*-{3,}[^*]*-{3,}\*\*', '', m.group(0), flags=re.S)
+        inner = re.sub(r'\s+', ' ', re.sub(r'<br\s*/?>', ' ', inner)).strip()
+        if len(inner) <= 60 and (MONEY_RE.search(inner) or PRICE_LABEL_RE.match(inner)):
+            return f'\n\n{KEPT_MARK}{inner}\n\n'
+        return ''
+    text = PICTURE_TEXT_RE.sub(repl, text)
+    # the image just above a kept text box is a picture of that same box
+    out = []
+    for line in text.split('\n'):
+        if line.startswith(KEPT_MARK):
+            k = len(out) - 1
+            while k >= 0 and not out[k].strip():
+                k -= 1
+            if k >= 0 and IMAGE_LINE_RE.match(out[k]):
+                del out[k]
+            line = line[len(KEPT_MARK):]
+        out.append(line)
+    return '\n'.join(out)
+
+
+KEPT_MARK = '\x00kept:'
+
+
+def cover_extras(text, title):
+    """(subtitle, kicker) from a cover page's text: its descriptive sentence and its small label."""
+    title_key = re.sub(r'\W+', '', title or '').lower()
+    subtitle = kicker = ''
+    for line in text.split('\n'):
+        raw = _strip_markup(HEADING_RE.sub(lambda m: m.group(2), line.strip()))
+        if not raw or IMAGE_LINE_RE.match(line) or re.sub(r'\W+', '', raw).lower() == title_key:
+            continue
+        words = raw.split()
+        if sum(len(w) == 1 for w in words) > len(words) / 2:
+            continue  # letter-spaced logo lettering: "E I G E R  S E C U R I T Y"
+        if len(words) >= 6 and len(raw) <= 220 and len(raw) > len(subtitle):
+            subtitle = raw
+        elif not kicker and 2 <= len(words) <= 6 and len(raw) <= 48:
+            kicker = raw
+    return subtitle, kicker
 
 
 def is_toc_page(text):
@@ -208,6 +273,63 @@ def _drop_number_only_headings(text):
                      if not ((m := HEADING_RE.match(l)) and not re.search(r'[A-Za-z]{2}', _strip_markup(m.group(2)))))
 
 
+DESIGNED_MAX_PAGES = 16
+
+
+def _promote_page_title(text, title):
+    """Make the heading that matches the page's main title a top-level heading."""
+    want = _words(title)
+    lines = text.split('\n')
+    for k, line in enumerate(lines):
+        m = HEADING_RE.match(line)
+        if m and _words(m.group(2)) == want:
+            lines[k] = '# ' + m.group(2)
+            break
+    return '\n'.join(lines)
+
+
+def recover_missed_images(doc, chunks, img_dir, dpi=150):
+    """
+    The layout model sometimes fails to see a picture (a product photo inside a framed panel).
+    Any sizeable region of embedded images that it did not mark as a picture is rendered from
+    the page and referenced in that page's text at its reading position.
+    """
+    import pymupdf
+    for n, chunk in enumerate(chunks):
+        page = doc[n]
+        area = abs(page.rect)
+        rects = []
+        for info in page.get_image_info():
+            r = pymupdf.Rect(info['bbox']) & page.rect
+            if r.width >= 24 and r.height >= 24 and abs(r) < area * 0.85:
+                rects.append(r)
+        regions = []
+        for r in sorted(rects, key=lambda r: -abs(r)):  # merge overlapping placements into regions
+            for k, reg in enumerate(regions):
+                if abs(reg & r) > 0:
+                    regions[k] = reg | r
+                    break
+            else:
+                regions.append(r)
+        boxes = chunk.get('page_boxes') or []
+        # already captured: as pictures (one, or several that together cover the region) or as a table
+        seen = [pymupdf.Rect(b['bbox']) for b in boxes if b.get('class') in ('picture', 'table', 'formula')]
+        text, inserts = chunk.get('text', ''), []
+        for k, reg in enumerate(regions):
+            if abs(reg) < area * 0.03 or sum(abs(reg & p) for p in seen) >= abs(reg) * 0.4:
+                continue
+            above = [b for b in boxes if b.get('pos') and b['bbox'][3] <= reg.y0 + 4
+                     and b.get('class') not in ('page-header', 'page-footer')]
+            at = max((b['pos'][1] for b in above), default=0)
+            path = f'{img_dir}/missed-{n + 1:04d}-{k:02d}.png'
+            page.get_pixmap(clip=reg, dpi=dpi).save(path)
+            inserts.append((at, f'\n\n![]({path})\n\n'))
+        for at, ref in sorted(inserts, reverse=True):
+            text = text[:at] + ref + text[at:]
+        chunk['text'] = text
+    return chunks
+
+
 def assemble(page_texts, info):
     """
     Join per-page Markdown into one document: figures' inner text removed, contents/legal/cover
@@ -216,16 +338,23 @@ def assemble(page_texts, info):
     chapters = info.get('chapters', {})
     acronyms = info.get('acronyms', set())
     first_chapter = min(chapters) if chapters else None
+    # A short document without chapters is laid out page by page (a brochure, a one-pager): each
+    # page's main heading opens a section, whatever heading level the converter gave it
+    page_titles = info.get('page_titles', {})
+    designed = not chapters and len(page_texts) <= DESIGNED_MAX_PAGES
     out, current_words = [], set()
     for n, raw in enumerate(page_texts):
         text = _drop_number_only_headings(strip_picture_text(raw))
         words = len(re.sub(r'!\[[^\]]*\]\([^)]*\)', '', text).split())
         if is_toc_page(text) or is_legal_page(text):
             continue
-        if first_chapter is not None and n < first_chapter and words < 60:
-            continue  # cover and title pages; a real preface (60+ words) is kept
-        if first_chapter is None and n == 0 and len(page_texts) > 3 and words < 40:
-            continue  # a bare cover page
+        bare_cover = (first_chapter is not None and n < first_chapter and words < 60) or \
+            (first_chapter is None and n == 0 and len(page_texts) > 3 and words < 40)
+        if bare_cover:
+            # cover and title pages; a real preface (60+ words) is kept. Their tagline is saved.
+            if n == 0:
+                info['cover_subtitle'], info['cover_kicker'] = cover_extras(text, info.get('cover_title', ''))
+            continue
         if n in chapters:
             current_words = set(_words(chapters[n]))
         if current_words:
@@ -242,5 +371,7 @@ def assemble(page_texts, info):
             text = '\n'.join(kept)
         if n in chapters:
             text = f'## {smart_title(chapters[n], acronyms)} {CHAPTER_MARK}\n\n' + text
+        elif designed and n in page_titles:
+            text = _promote_page_title(text, page_titles[n])
         out.append(text)
     return '\n\n'.join(out)

@@ -9,6 +9,7 @@ belongs to. Afterwards:
   - junk images (tiny icons, thin rules, blank boxes, repeated logos) are dropped
   - photos are recompressed so the finished deck stays small
 """
+import json
 import logging
 import os
 import re
@@ -75,6 +76,10 @@ def convert_pdf(pdf_path, out_dir, progress=None, uses_llm=False):
         except Exception as exc:
             log.exception('pymupdf4llm failed')
             raise PdfConversionError(f'Could not read this PDF: {exc}') from exc
+        try:
+            pdf_structure.recover_missed_images(doc, chunks, str(img_dir), RENDER_DPI)
+        except Exception:  # a safety net only: never fail a conversion over it
+            log.exception('Recovering missed images failed')
 
     text = pdf_structure.assemble([c.get('text', '') for c in chunks], info)
     text = relative_image_refs(text, img_dir)
@@ -82,6 +87,9 @@ def convert_pdf(pdf_path, out_dir, progress=None, uses_llm=False):
     text = optimize_images(text, out_dir)
     text = normalize_headings(clean_markdown(text), choose_title(meta_title, info.get('cover_title', '')),
                               info.get('acronyms', ()))
+    meta = {'pages': len(chunks), 'chapters': len(info.get('chapters', {})),
+            'subtitle': info.get('cover_subtitle', ''), 'kicker': info.get('cover_kicker', '')}
+    text = f'<!-- pdf2pptx {json.dumps(meta, ensure_ascii=False)} -->\n\n' + text
     words = len(re.sub(r'!\[[^\]]*\]\([^)]*\)', '', text).split())
     if words < 20:
         raise PdfConversionError('No readable text was found. This looks like a scanned PDF; '

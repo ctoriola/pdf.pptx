@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 import condense
+import semantics
 import text_repair
 from deck_builder import build_deck
 from md_parse import parse_markdown, word_count
@@ -56,18 +57,21 @@ def merge_empty_sections(sections):
 
 def move_trailing_subheadings(sections):
     """
-    A sub-heading with nothing after it (a product name like "DSO-1" set just above the next
-    heading) introduces the next section, so it moves to the start of that section.
+    A sub-heading with nothing after it (a product name like "DSO-1", or a label such as
+    "01 / TACTICAL SHOTGUN" set just above the next heading) introduces the next section, so it
+    moves to the start of that section. A section left empty by this is dropped.
     """
     out = [(name, list(blocks)) for name, blocks in sections]
     for i in range(len(out) - 1):
         name, blocks = out[i]
         moved = []
-        while len(blocks) > 1 and blocks[-1]['type'] == 'sub':
+        while blocks and blocks[-1]['type'] == 'sub':
             moved.insert(0, blocks.pop())
         if moved:
-            out[i + 1] = (out[i + 1][0], moved + out[i + 1][1])
-    return out
+            nxt_name, nxt_blocks = out[i + 1]
+            at = 1 if nxt_blocks and nxt_blocks[0]['type'] == 'chapter' else 0
+            out[i + 1] = (nxt_name, nxt_blocks[:at] + moved + nxt_blocks[at:])
+    return [(name, blocks) for name, blocks in out if blocks]
 
 
 def deck_title(md_title, pdf_path, override=None):
@@ -89,6 +93,10 @@ def build_from_markdown(md_path, mode='standard', theme='coral', title=None, pdf
     title = deck_title(md_title, pdf_path, title)
     if len(sections) == 1 and sections[0][0] == 'Overview':
         sections = [(title, sections[0][1])]  # a document with no headings: its slides carry its title
+    # What kind of document is this, and what is each piece (a product, a price, a process)?
+    doc_meta = semantics.read_doc_meta(Path(md_path).read_text(encoding='utf-8'))
+    sections = semantics.structure(sections)
+    kind = semantics.classify(doc_meta, sections)
     log.info('%s: %d sections, %d words', title, len(sections), sum(word_count(b) for _, b in sections))
 
     if plan['mode'] == 'condensed':
@@ -97,8 +105,10 @@ def build_from_markdown(md_path, mode='standard', theme='coral', title=None, pdf
         sections = condense.expand_sections(title, sections, plan, progress)
 
     progress('Building slides…')
-    buffer, slide_total = build_deck(title, sections, theme=theme, subtitle=SUBTITLES[plan['mode']],
-                                     one_slide_per_section=plan['one_slide_per_section'], agenda=plan['agenda'])
+    buffer, slide_total = build_deck(title, sections, theme=theme,
+                                     subtitle=doc_meta.get('kicker') or SUBTITLES[plan['mode']],
+                                     one_slide_per_section=plan['one_slide_per_section'], agenda=plan['agenda'],
+                                     tagline=doc_meta.get('subtitle', ''), kind=kind)
     return buffer, title, slide_total
 
 

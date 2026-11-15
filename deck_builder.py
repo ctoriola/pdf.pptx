@@ -22,6 +22,7 @@ from pptx.oxml.ns import qn
 from pptx.util import Emu, Inches, Pt
 
 from md_parse import inline_runs, list_labels, list_levels, plain, slice_list
+from semantics import content, get_meta, layout_of
 
 
 # ---------- Themes ----------
@@ -109,6 +110,11 @@ def text_height(blocks, width_in, size_pt):
             height += math.ceil(len(plain(b['text'])) / per_line) * line_h + size_pt * 0.6 / 72
         elif b['type'] == 'sub':
             height += line_h * 1.15 + size_pt * 0.9 / 72
+        elif b['type'] == 'price':
+            height += line_h * 2.3 + (line_h if b.get('note') else 0)
+        elif b['type'] == 'steps':
+            for item in b['items']:
+                height += (1 + math.ceil(len(plain(item['text'])) / max(10, per_line - 3))) * line_h + size_pt * 0.5 / 72
         elif b['type'] == 'list':
             item_chars = max(10, per_line - 3)
             for item in b['items']:
@@ -330,6 +336,27 @@ def add_rich_text(slide, x, y, w, h, blocks, size):
             p.space_after = Pt(size * 0.3)
             r = p.add_run(); r.text = plain(b['text'])
             _style(r, size + 2, T.accent_strong, True, font=T.head_font)
+        elif b['type'] == 'price':
+            p = new_par()
+            p.space_after = Pt(size * 0.6)
+            r = p.add_run(); r.text = f'{b.get("label") or "Price"}: '
+            _style(r, size, T.muted, True)
+            r = p.add_run(); r.text = b['amount'] + (f' {b["unit"]}' if b.get('unit') else '')
+            _style(r, size + 4, T.accent_strong, True, font=T.head_font)
+            if b.get('note'):
+                r = p.add_run(); r.text = f'  ({b["note"]})'
+                _style(r, max(size - 3, 10), T.muted)
+        elif b['type'] == 'steps':
+            for n, item in enumerate(b['items'], 1):
+                p = new_par()
+                p.space_after = Pt(size * 0.5)
+                _labelled(p, 0, hang)
+                r = p.add_run(); r.text = f'{n}.\t'
+                _style(r, size, T.accent_strong, True)
+                r = p.add_run(); r.text = plain(item['title'])
+                _style(r, size, T.ink, True)
+                if item.get('text'):
+                    add_runs(p, ' — ' + item['text'])
         elif b['type'] == 'list' and b['items']:
             for item, label, level in zip(b['items'], list_labels(b), list_levels(b)):
                 p = new_par()
@@ -425,13 +452,15 @@ def is_portrait(path):
 # Slide builders
 # ============================================================
 class DeckBuilder:
-    def __init__(self, deck_title, subtitle='Presentation', one_slide_per_section=False):
+    def __init__(self, deck_title, subtitle='Presentation', one_slide_per_section=False, tagline=''):
         self.prs = Presentation()
         self.prs.slide_width = Inches(SLIDE_W)
         self.prs.slide_height = Inches(SLIDE_H)
         self.blank = self.prs.slide_layouts[6]
         self.title = deck_title
         self.subtitle = subtitle
+        self.tagline = tagline
+        self.kicker = ''   # the small label above the current section's title, if it has one
         self.page = 0
         self.one_slide_per_section = one_slide_per_section
 
@@ -450,8 +479,11 @@ class DeckBuilder:
             number_badge(slide, MARGIN, 0.62, 0.62, f'{number:02d}', size=15 if number < 100 else 11)
             offset = 0.85
         size = 30 if len(title) <= 55 else 24 if len(title) <= 80 else 20
-        add_text(slide, MARGIN + offset, 0.5, CONTENT_W - offset, 0.85, title, size, T.ink, bold=True,
-                 anchor=MSO_ANCHOR.MIDDLE, font=T.head_font)
+        kicker = self.kicker if not re.search(r'\((cont\.|figures|table)\)$', title) else ''
+        if kicker:  # "01 / TACTICAL SHOTGUN" set small above the title
+            add_text(slide, MARGIN + offset, 0.38, CONTENT_W - offset, 0.3, kicker.upper(), 12, T.accent, bold=True)
+        add_text(slide, MARGIN + offset, 0.62 if kicker else 0.5, CONTENT_W - offset, 0.85, title, size, T.ink,
+                 bold=True, anchor=MSO_ANCHOR.MIDDLE, font=T.head_font)
         add_text(slide, MARGIN, 7.0, 8, 0.3, self.title, 10, T.muted)
         add_text(slide, SLIDE_W - MARGIN - 1, 7.0, 1, 0.3, str(self.page), 10, T.muted, align=PP_ALIGN.RIGHT)
 
@@ -467,6 +499,11 @@ class DeckBuilder:
         size = 54 if n <= 22 else 44 if n <= 36 else 36 if n <= 60 else 28
         add_text(slide, MARGIN + 0.1, 1.75, 7.6, 4.2, self.title, size, T.cover_text, bold=True, font=T.head_font,
                  anchor=MSO_ANCHOR.TOP, line_spacing=0.95)
+        if self.tagline:
+            per_line = max(8, int(7.6 / (size * 0.5 / 72)))
+            lines = math.ceil(n / per_line)
+            add_text(slide, MARGIN + 0.1, 1.75 + lines * size * 0.98 / 72 + 0.3, 7.2, 1.6, self.tagline, 18,
+                     T.cover_muted, line_spacing=1.1)
         add_text(slide, MARGIN + 0.1, 6.35, 7, 0.4, date.today().strftime('%B %Y'), 14, T.cover_muted)
 
     def agenda(self, section_names, noun='sections'):
@@ -517,10 +554,18 @@ class DeckBuilder:
                  anchor=MSO_ANCHOR.TOP, line_spacing=0.98)
 
     def section(self, number, name, blocks):
-        blocks = [b for b in blocks if b['type'] != 'chapter']
+        meta = get_meta(blocks) or {}
+        blocks = content(blocks)
         if not blocks:
             return
+        self.kicker = meta.get('kicker', '')
         notes = section_notes(name, blocks)
+        if meta.get('layout') == 'product' and self._product_slide(number, name, blocks, meta, notes):
+            return
+        if meta.get('layout') == 'steps' and self._steps_slide(number, name, blocks, notes):
+            return
+        if meta.get('tagline'):  # not laid out as a product after all: the tagline is body text again
+            blocks = [{'type': 'para', 'text': meta['tagline']}] + blocks
         images = [b for b in blocks if b['type'] == 'image' and image_size(b['path'])]
         text = [b for b in blocks if b['type'] != 'image']
         if not images:
@@ -540,6 +585,113 @@ class DeckBuilder:
             used = len(side)
         if images[used:]:
             self._gallery_slides(number, name, images[used:], notes)
+
+    def _product_slide(self, number, name, blocks, meta, notes):
+        """
+        One slide for one product: photo and price on the left; tagline, description and the
+        spec sheet on the right. Returns False (so the ordinary flow is used) if it cannot fit.
+        """
+        images = [b for b in blocks if b['type'] == 'image' and image_size(b['path'])]
+        table = next((b for b in blocks if b['type'] == 'table'), None)
+        price = next((b for b in blocks if b['type'] == 'price'), None)
+        prose = [b for b in blocks if b['type'] in ('para', 'quote')]
+        if not images or table is None or any(b['type'] in ('list', 'steps', 'sub') for b in blocks):
+            return False
+        # fine print ("Documentation required: ...") sits under the price, not in the description
+        small = [b for b in prose if b['type'] == 'para' and re.match(r'^\*\*[^*]{3,40}:\*\*', b['text'].strip())]
+        desc = [b for b in prose if b not in small]
+        rows = table['rows']
+        left_w, gap = 5.5, 0.45
+        right_x, right_w = MARGIN + left_w + gap, CONTENT_W - left_w - gap
+        tag_h = 0.5 if meta.get('tagline') else 0.0
+        label_h = 0.32 if table.get('label') else 0.0
+        # the largest spec-sheet size at which the description still fits above it at a readable size
+        for spec_size, floor in ((16, 13), (15, 13), (14, 13), (13, 12), (12, 12), (11, 11), (10, 10)):
+            heights = table_row_heights(rows, right_w, spec_size, kv=True, min_h=spec_size * 0.021, pad=0.1)
+            desc_room = CONTENT_H - tag_h - label_h - sum(heights) - 0.2
+            desc_size = fit_size(desc, right_w, desc_room, floor) if desc else spec_size
+            if desc_size:
+                break
+        else:
+            return False
+        desc_size = min(desc_size, 18)
+        slide = self._new_slide(notes)
+        self._chrome(slide, number, name)
+        # ---- left: photo, price, fine print
+        price_h = 1.4 if price else 0.0
+        small_size = 12
+        small_h = min(1.0, text_height(small, left_w, small_size) + 0.05) if small else 0.0
+        img_h = CONTENT_H - (price_h + 0.2 if price else 0) - (small_h + 0.12 if small else 0)
+        add_box(slide, MARGIN, CONTENT_TOP, left_w, img_h, T.panel, MSO_SHAPE.ROUNDED_RECTANGLE, 0.04)
+        place_image(slide, images[0]['path'], MARGIN + 0.2, CONTENT_TOP + 0.15, left_w - 0.4, img_h - 0.3,
+                    images[0].get('caption', ''))
+        y = CONTENT_TOP + img_h + 0.2
+        if price:
+            add_box(slide, MARGIN, y, left_w, price_h, T.cover_bg, MSO_SHAPE.ROUNDED_RECTANGLE, 0.1)
+            add_text(slide, MARGIN + 0.3, y + 0.16, 2.0, 0.3, (price.get('label') or 'Price').upper(), 11,
+                     T.cover_muted, bold=True)
+            amount_size = 32 if len(price['amount']) <= 12 else 26
+            add_text(slide, MARGIN + 0.3, y + 0.42, left_w - 0.6, 0.6, price['amount'], amount_size, T.cover_text,
+                     bold=True, font=T.head_font, anchor=MSO_ANCHOR.MIDDLE)
+            detail = ' · '.join(x for x in (price.get('unit'), price.get('note')) if x)
+            if detail:
+                add_text(slide, MARGIN + 0.3, y + 1.0, left_w - 0.6, 0.3, detail, 11, T.cover_muted)
+            y += price_h + 0.12
+        if small:
+            add_rich_text(slide, MARGIN, y, left_w, small_h, small, small_size)
+        # ---- right: tagline, description, spec sheet
+        y = CONTENT_TOP
+        if meta.get('tagline'):
+            add_text(slide, right_x, y, right_w, 0.45, meta['tagline'], 17, T.accent_strong, bold=True,
+                     font=T.head_font)
+            y += tag_h
+        if desc:
+            desc_h = text_height(desc, right_w, desc_size) + 0.05
+            add_rich_text(slide, right_x, y, right_w, desc_h, desc, desc_size)
+            y += desc_h + 0.1
+        if table.get('label'):
+            add_text(slide, right_x, y, right_w, 0.28, table['label'].upper(), 11, T.muted, bold=True)
+            y += label_h
+        self._draw_table(slide, right_x, right_w, rows, spec_size, heights, y=y, kv=True)
+        if images[1:]:
+            self._gallery_slides(number, name, images[1:], notes)
+        return True
+
+    def _steps_slide(self, number, name, blocks, notes):
+        """A process on one slide: numbered badge, step title, one line of text for each step."""
+        steps = next((b for b in blocks if b['type'] == 'steps'), None)
+        intro = [b for b in blocks if b['type'] in ('para', 'quote')]
+        if steps is None or not 2 <= len(steps['items']) <= 8 or any(
+                b['type'] not in ('steps', 'para', 'quote') for b in blocks):
+            return False
+        items = steps['items']
+        slide = self._new_slide(notes)
+        self._chrome(slide, number, name)
+        top = CONTENT_TOP
+        if intro:
+            size = fit_size(intro, CONTENT_W, 0.9) or 14
+            h = min(0.9, text_height(intro, CONTENT_W, size) + 0.05)
+            add_rich_text(slide, MARGIN, top, CONTENT_W, h, intro, size)
+            top += h + 0.15
+        cols = 1 if len(items) <= 5 else 2
+        per_col = math.ceil(len(items) / cols)
+        col_w = (CONTENT_W - GAP * (cols - 1)) / cols
+        row_h = min(1.15, (CONTENT_BOTTOM - top) / per_col)
+        badge = min(0.62, row_h - 0.25)
+        title_size = 20 if row_h >= 0.95 else 17
+        text_size = 15 if row_h >= 0.95 else 13
+        text_w = col_w - badge - 0.3
+        for n, item in enumerate(items):
+            c, r = divmod(n, per_col)
+            x, y = MARGIN + c * (col_w + GAP), top + r * row_h
+            number_badge(slide, x, y + 0.05, badge, str(n + 1), size=badge * 28)
+            add_text(slide, x + badge + 0.3, y, text_w, 0.4, plain(item['title']), title_size, T.ink, bold=True,
+                     font=T.head_font)
+            body = [{'type': 'para', 'text': item['text']}]
+            size = fit_size(body, text_w, row_h - 0.5, 11) or 11
+            add_text(slide, x + badge + 0.3, y + 0.42, text_w, row_h - 0.48, item['text'], min(size, text_size),
+                     T.body, markdown=True, line_spacing=1.05)
+        return True
 
     def _text_wide_image_slides(self, number, name, text, images, notes):
         """Text across the top, wide image(s) across the bottom. Returns how many images were placed."""
@@ -746,37 +898,55 @@ class DeckBuilder:
         table_w = CONTENT_W - side_w - 0.5
         if len(tables) == 1 and others:
             side_size = fits_budget(others, side_w) and fit_size(others, side_w, CONTENT_H, READABLE_PT - 2)
-            fit = table_fit(tables[0]['rows'], table_w, CONTENT_H)
+            kv = bool(tables[0].get('kv'))
+            fit = table_fit(tables[0]['rows'], table_w, CONTENT_H, kv=kv)
             if side_size and fit:
                 slide = self._new_slide(notes)
                 self._chrome(slide, number, name)
                 add_rich_text(slide, MARGIN, CONTENT_TOP + 0.05, side_w, CONTENT_H, others, side_size)
-                self._draw_table(slide, MARGIN + side_w + 0.5, table_w, tables[0]['rows'], *fit)
+                self._draw_table(slide, MARGIN + side_w + 0.5, table_w, tables[0]['rows'], *fit, kv=kv)
                 return
         first = True
         if has_text(others):
             self._text_slides(number, name, others, notes)
             first = False
         for table in tables:
-            for size, rows, heights in paginate_table(table['rows'], CONTENT_W, CONTENT_H):
+            kv = bool(table.get('kv'))
+            for size, rows, heights in paginate_table(table['rows'], CONTENT_W, CONTENT_H, kv=kv):
                 slide = self._new_slide(notes)
                 self._chrome(slide, number, name if first else f'{name} (table)')
-                self._draw_table(slide, MARGIN, CONTENT_W, rows, size, heights)
+                self._draw_table(slide, MARGIN, CONTENT_W, rows, size, heights, kv=kv)
                 first = False
 
-    def _draw_table(self, slide, x, width, rows, size, heights):
+    def _draw_table(self, slide, x, width, rows, size, heights, y=CONTENT_TOP, kv=False):
+        """A data table with a header row, or (kv) a spec sheet of label / value rows with none."""
         ncols = table_cols(rows)
-        shape = slide.shapes.add_table(len(rows), ncols, Inches(x), Inches(CONTENT_TOP),
+        shape = slide.shapes.add_table(len(rows), ncols, Inches(x), Inches(y),
                                        Inches(width), Inches(sum(heights)))
         tbl = shape.table
         tblPr = tbl._tbl.tblPr
         tblPr.set('bandRow', '0')
-        tblPr.set('firstRow', '1')
+        tblPr.set('firstRow', '0' if kv else '1')
+        if kv and ncols == 2:
+            tbl.columns[0].width = Inches(width * KV_LABEL_SHARE)
+            tbl.columns[1].width = Inches(width * (1 - KV_LABEL_SHARE))
         for r, row in enumerate(rows):
             tbl.rows[r].height = Inches(heights[r])
             for c in range(ncols):
                 cell = tbl.cell(r, c)
                 cell.fill.solid()
+                if kv:
+                    cell.fill.fore_color.rgb = T.panel if r % 2 == 0 else T.bg
+                    _cell_borders(cell, T.line)
+                    cell.margin_left = cell.margin_right = Inches(CELL_PAD_X)
+                    cell.margin_top = cell.margin_bottom = Inches(0.02)
+                    cell.vertical_anchor = MSO_ANCHOR.MIDDLE
+                    tf = cell.text_frame
+                    tf.word_wrap = True
+                    for t, bold, italic in inline_runs(row[c] if c < len(row) else ''):
+                        run = tf.paragraphs[0].add_run(); run.text = t
+                        _style(run, size, T.muted if c == 0 else T.ink, c == 1, italic)
+                    continue
                 cell.fill.fore_color.rgb = T.accent if r == 0 else (T.bg if r % 2 else T.panel)
                 _cell_borders(cell, T.line)
                 cell.margin_left = cell.margin_right = Inches(CELL_PAD_X)
@@ -803,35 +973,53 @@ def table_cols(rows):
     return min(MAX_TABLE_COLS, max(len(r) for r in rows))
 
 
-def table_row_heights(rows, width, size):
-    """Estimated height (inches) of each row at a font size, with equal column widths."""
+KV_LABEL_SHARE = 0.38  # width of the label column in a spec sheet
+
+
+def table_row_heights(rows, width, size, kv=False, min_h=0.4, pad=None):
+    """Estimated height (inches) of each row at a font size (equal columns, or 38/62 for a spec sheet)."""
     ncols = table_cols(rows)
-    inner = width / ncols - 2 * CELL_PAD_X
-    per_line = max(4, int(inner / (size * CHAR_EM.get(T.body_font, 0.52) / 72)))
+    shares = [KV_LABEL_SHARE, 1 - KV_LABEL_SHARE] if kv and ncols == 2 else [1 / ncols] * ncols
+    char_w = size * CHAR_EM.get(T.body_font, 0.52) / 72
     line_h = size * 1.2 / 72
     heights = []
     for row in rows:
-        lines = max([math.ceil(len(plain(c)) / per_line) for c in row[:ncols] if c] or [1])
-        heights.append(max(0.4, lines * line_h + 2 * CELL_PAD_Y + 0.08))
+        lines = 1
+        for c, cell in enumerate(row[:ncols]):
+            per_line = max(4, int((width * shares[c] - 2 * CELL_PAD_X) / char_w))
+            lines = max(lines, math.ceil(len(plain(cell)) / per_line))
+        heights.append(max(min_h, lines * line_h + (2 * CELL_PAD_Y + 0.08 if pad is None else pad)))
     return heights
 
 
-def table_fit(rows, width, height, sizes=TABLE_SIZES):
+def table_fit(rows, width, height, sizes=TABLE_SIZES, kv=False):
     """(size, row heights) for the largest font at which the whole table fits, else None."""
     for size in sizes:
-        heights = table_row_heights(rows, width, size)
+        heights = table_row_heights(rows, width, size, kv=kv)
         if sum(heights) <= height:
             return size, heights
     return None
 
 
-def paginate_table(rows, width, height):
-    """[(size, rows, heights)]: the whole table if it fits, else pages at 11pt with the header repeated."""
-    fit = table_fit(rows, width, height)
+def paginate_table(rows, width, height, kv=False):
+    """
+    [(size, rows, heights)]: the whole table if it fits, else pages at 11pt with the header
+    repeated (a spec sheet has no header row, so its pages simply continue).
+    """
+    fit = table_fit(rows, width, height, kv=kv)
     if fit:
         return [(fit[0], rows, fit[1])]
     size = 11
-    heights = table_row_heights(rows, width, size)
+    heights = table_row_heights(rows, width, size, kv=kv)
+    if kv:
+        pages, cur, cur_h = [], [], []
+        for row, h in zip(rows, heights):
+            if cur and sum(cur_h) + h > height:
+                pages.append((size, cur, cur_h))
+                cur, cur_h = [], []
+            cur.append(row)
+            cur_h.append(h)
+        return pages + [(size, cur, cur_h)]
     header, header_h = rows[0], heights[0]
     pages, cur, cur_h = [], [], []
     for row, h in zip(rows[1:], heights[1:]):
@@ -961,7 +1149,8 @@ def pack_small_sections(sections):
         if out:
             prev_name, prev_blocks = out[-1]
             joined = prev_blocks + [{'type': 'sub', 'text': name}] + list(blocks)
-            if (not is_chapter(blocks) and can_follow(numbers[-1], number)
+            if (not is_chapter(blocks) and not layout_of(blocks) and not layout_of(prev_blocks)
+                    and can_follow(numbers[-1], number)
                     and section_height(blocks) <= TEXT_BUDGET * SMALL_SECTION
                     and not any(b['type'] == 'table' for b in joined)
                     and section_height(joined) <= TEXT_BUDGET * PACK_FILL):
@@ -1003,8 +1192,8 @@ def split_long_sections(sections):
     out = []
     for name, blocks in sections:
         width = CONTENT_W - 5.6 - GAP if any(b['type'] == 'image' for b in blocks) else CONTENT_W - 4.55
-        if sum(block_height(b, width) for b in blocks) <= TEXT_BUDGET:
-            out.append((name, blocks))
+        if layout_of(blocks) or sum(block_height(b, width) for b in blocks) <= TEXT_BUDGET:
+            out.append((name, blocks))  # fits, or is a designed unit (a product, a process)
             continue
         runs, run = [], []
         for b in blocks:
@@ -1047,6 +1236,11 @@ def section_notes(name, blocks):
             lines.extend(' | '.join(plain(c) for c in r) for r in b['rows'])
         elif b['type'] == 'image' and b.get('caption'):
             lines.append(f'[Figure: {b["caption"]}]')
+        elif b['type'] == 'price':
+            lines.append(' '.join(x for x in (f'{b.get("label") or "Price"}:', b['amount'], b.get('unit'),
+                                              f'({b["note"]})' if b.get('note') else '') if x))
+        elif b['type'] == 'steps':
+            lines.extend(f'{n}. {plain(i["title"])}: {plain(i["text"])}' for n, i in enumerate(b['items'], 1))
     return '\n'.join(lines)
 
 
@@ -1104,7 +1298,7 @@ AGENDA_RANGE = (3, 14)
 
 
 def build_deck(title, sections, theme=DEFAULT_THEME, subtitle='Presentation', one_slide_per_section=False,
-               agenda=True):
+               agenda=True, tagline='', kind='document'):
     """
     Return (BytesIO of the finished .pptx, slide count).
     sections: [(section_title, [blocks])] with image paths already resolved.
@@ -1113,11 +1307,11 @@ def build_deck(title, sections, theme=DEFAULT_THEME, subtitle='Presentation', on
     with _theme_lock:  # T and TEXT_BUDGET are module state; keep concurrent builds apart
         T = THEMES.get(theme, THEMES[DEFAULT_THEME])
         try:
-            builder = _build(title, sections, subtitle, one_slide_per_section, agenda)
+            builder = _build(title, sections, subtitle, one_slide_per_section, agenda, tagline, kind)
             if not one_slide_per_section and builder.page > DENSE_AFTER:
                 fill = min(MAX_TEXT_FILL, TEXT_FILL * builder.page / DENSE_AFTER)
                 TEXT_BUDGET = CONTENT_H * fill
-                builder = _build(title, sections, subtitle, one_slide_per_section, agenda)
+                builder = _build(title, sections, subtitle, one_slide_per_section, agenda, tagline, kind)
             buffer = BytesIO()
             builder.prs.save(buffer)
             buffer.seek(0)
@@ -1127,8 +1321,11 @@ def build_deck(title, sections, theme=DEFAULT_THEME, subtitle='Presentation', on
             TEXT_BUDGET = CONTENT_H * TEXT_FILL
 
 
-def _build(title, sections, subtitle, one_slide_per_section, agenda):
-    builder = DeckBuilder(title, subtitle, one_slide_per_section)
+BROCHURE_AGENDA_MIN = 7  # a short brochure needs no agenda slide
+
+
+def _build(title, sections, subtitle, one_slide_per_section, agenda, tagline='', kind='document'):
+    builder = DeckBuilder(title, subtitle, one_slide_per_section, tagline)
     sections = [(n, b) for n, b in sections if b] or \
         [('Overview', [{'type': 'para', 'text': 'No content was found in this document.'}])]
     if not one_slide_per_section:
@@ -1137,7 +1334,8 @@ def _build(title, sections, subtitle, one_slide_per_section, agenda):
     builder.cover()
     if agenda and len(chapters) >= 2:
         builder.agenda(chapters[:20], 'chapters')
-    elif agenda and AGENDA_RANGE[0] <= len(sections) <= AGENDA_RANGE[1]:
+    elif agenda and AGENDA_RANGE[0] <= len(sections) <= AGENDA_RANGE[1] \
+            and not (kind == 'brochure' and len(sections) < BROCHURE_AGENDA_MIN):
         builder.agenda([n for n, _ in sections])
     chapter_no = 0
     for i, (name, blocks) in enumerate(sections, start=1):
