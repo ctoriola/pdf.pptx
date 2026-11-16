@@ -308,7 +308,7 @@ def test_app_rejects_bad_input(client):
     assert client.post('/convert', data={'pdf': (io.BytesIO(b'hello'), 'x.pdf')}).status_code == 400
     with open(SAMPLE_PDF, 'rb') as f:
         res = client.post('/convert', data={'pdf': (f, 'sample.pdf'), 'mode': 'condensed'})
-    assert res.status_code == 400 and 'AI key' in res.json['error']
+    assert res.status_code == 400 and 'not switched on' in res.json['error'] and 'GROQ' not in res.json['error']
 
 
 def test_bold_lines_become_headings():
@@ -471,24 +471,37 @@ class FakeB2Api:
         return self.response(200, {'bucketName': 'my-bucket'})
 
 
+SETUP_TOKEN = 'owner-only-setup-token-1234'
+
+
+def signed_in(client):
+    """Enter the owner's setup password, as the owner would, and keep the cookie it sets."""
+    res = client.post('/setup', data={'password': SETUP_TOKEN})
+    assert res.status_code == 303
+    return client
+
+
 @pytest.fixture
 def setup_client(monkeypatch):
     for k, v in B2_ENV.items():
         monkeypatch.setenv(k, v)
+    monkeypatch.setenv('SETUP_TOKEN', SETUP_TOKEN)
     import app as webapp
     import b2_admin
     api = FakeB2Api()
     monkeypatch.setattr(b2_admin.requests, 'get', api.get)
     monkeypatch.setattr(b2_admin.requests, 'post', api.post)
     monkeypatch.setattr(b2_admin, 'check_app_key', lambda: None)
-    return webapp.app.test_client(), api
+    monkeypatch.setattr(webapp.time, 'sleep', lambda s: None)
+    return signed_in(webapp.app.test_client()), api
 
 
 def test_setup_page_lists_missing_settings(monkeypatch):
     for k in B2_ENV:
         monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv('SETUP_TOKEN', SETUP_TOKEN)
     import app as webapp
-    html = webapp.app.test_client().get('/setup').data.decode()
+    html = signed_in(webapp.app.test_client()).get('/setup').data.decode()
     assert 'B2_BUCKET</code>&nbsp;is missing' in html and '<form' not in html
 
 
@@ -1242,3 +1255,87 @@ def test_app_reports_how_the_deck_was_planned(client):
     with open(SAMPLE_PDF, 'rb') as f:
         res = client.post('/convert', data={'pdf': (f, 'sample.pdf'), 'mode': 'standard'})
     assert res.status_code == 200 and res.headers['X-Planner'] == 'rules' and res.headers['X-Kind'] in planner.KINDS
+
+
+# ---------- the setup page is for the owner only ----------
+@pytest.fixture
+def open_web(monkeypatch):
+    """The app with storage configured and a setup token set, visited by someone who is NOT signed in."""
+    for k, v in B2_ENV.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv('SETUP_TOKEN', SETUP_TOKEN)
+    import app as webapp
+    import b2_admin
+    calls = []
+    monkeypatch.setattr(b2_admin, 'configure_bucket', lambda *a, **k: calls.append(a) or {'bucket': 'x', 'origins': ['*']})
+    monkeypatch.setattr(b2_admin, 'check_app_key', lambda: None)
+    monkeypatch.setattr(webapp.time, 'sleep', lambda s: None)
+    return webapp.app.test_client(), calls
+
+
+SECRETS_ON_THE_PAGE = ('B2_KEY_ID', 'B2_BUCKET', 'my-bucket', 'Master', 'Vercel settings', 'Backblaze')
+
+
+def test_setup_does_not_exist_without_a_token(monkeypatch):
+    for k, v in B2_ENV.items():
+        monkeypatch.setenv(k, v)
+    import app as webapp
+    client = webapp.app.test_client()
+    for token in (None, '', 'short', 'x' * 15):  # unset, empty, or too short to resist guessing
+        monkeypatch.delenv('SETUP_TOKEN', raising=False) if token is None else monkeypatch.setenv('SETUP_TOKEN', token)
+        for res in (client.get('/setup'), client.post('/setup', data={'password': token or ''}),
+                    client.post('/setup', data={'key_id': 'm', 'key': 'k'})):
+            assert res.status_code == 404
+            assert not any(word in res.data.decode() for word in SECRETS_ON_THE_PAGE)
+    assert client.get('/setup').data == client.get('/no-such-page').data  # indistinguishable from any unknown address
+
+
+def test_setup_shows_nothing_until_the_password_is_entered(open_web):
+    client, calls = open_web
+    res = client.get('/setup')
+    html = res.data.decode()
+    assert res.status_code == 401 and 'name="password"' in html
+    assert not any(word in html for word in SECRETS_ON_THE_PAGE)
+    assert res.headers['Cache-Control'] == 'no-store' and 'noindex' in res.headers['X-Robots-Tag']
+    for wrong in ('', 'guess', SETUP_TOKEN[:-1], SETUP_TOKEN + 'x', SETUP_TOKEN.upper()):
+        res = client.post('/setup', data={'password': wrong})
+        assert res.status_code == 401 and 'Set-Cookie' not in res.headers
+        assert not any(word in res.data.decode() for word in SECRETS_ON_THE_PAGE)
+    assert client.get('/setup').status_code == 401  # still locked after the failed attempts
+
+
+def test_setup_cannot_be_run_without_signing_in(open_web):
+    client, calls = open_web
+    res = client.post('/setup', data={'key_id': 'master', 'key': 'SECRET', 'origins': ''})
+    assert res.status_code == 401 and calls == []  # a master key posted by a stranger goes nowhere
+    client.set_cookie('setup_auth', 'forged-value', path='/setup')
+    assert client.post('/setup', data={'key_id': 'master', 'key': 'SECRET'}).status_code == 401 and calls == []
+    client.set_cookie('setup_auth', '', path='/setup')
+    assert client.get('/setup').status_code == 401
+
+
+def test_owner_signs_in_with_the_token(open_web):
+    client, calls = open_web
+    res = client.post('/setup', data={'password': SETUP_TOKEN})
+    cookie = res.headers['Set-Cookie']
+    assert res.status_code == 303 and 'HttpOnly' in cookie and 'SameSite=Strict' in cookie and 'Path=/setup' in cookie
+    assert SETUP_TOKEN not in cookie  # the browser never holds the password itself
+    html = client.get('/setup').data.decode()
+    assert 'Vercel settings' in html and 'my-bucket' in html
+    assert client.post('/setup', data={'key_id': 'master', 'key': 'SECRET'}).status_code == 200 and len(calls) == 1
+
+
+def test_a_changed_token_signs_everyone_out(open_web, monkeypatch):
+    client, _ = open_web
+    signed_in(client)
+    assert client.get('/setup').status_code == 200
+    monkeypatch.setenv('SETUP_TOKEN', 'a-different-owner-token-5678')
+    assert client.get('/setup').status_code == 401
+    monkeypatch.delenv('SETUP_TOKEN')
+    assert client.get('/setup').status_code == 404  # removing the token removes the page
+
+
+def test_nothing_public_mentions_the_setup_page(client, cloud):
+    for c in (client, cloud[0]):
+        html = c.get('/').data.decode()
+        assert '/setup' not in html and 'Storage setup' not in html

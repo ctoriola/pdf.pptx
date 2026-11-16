@@ -11,16 +11,19 @@ Two upload routes:
   - Direct: the PDF is posted in the request and the file is returned in the response.
     On Vercel this is capped at 4.5 MB each way.
 """
+import hashlib
+import hmac
 import io
 import json
 import logging
 import os
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, abort, jsonify, redirect, render_template, request, send_file
 
 load_dotenv()
 
@@ -62,10 +65,53 @@ def index():
 B2_SETTINGS = ('B2_KEY_ID', 'B2_APPLICATION_KEY', 'B2_BUCKET', 'B2_ENDPOINT')
 
 
+SETUP_COOKIE = 'setup_auth'
+SETUP_SESSION_SECONDS = 30 * 60
+SETUP_TOKEN_MIN = 16
+
+
+def _setup_token():
+    """The owner's setup password. Unset, or too short to resist guessing, means the page does not exist."""
+    token = os.environ.get('SETUP_TOKEN', '').strip()
+    return token if len(token) >= SETUP_TOKEN_MIN else ''
+
+
+def _setup_proof(token):
+    """What the browser holds after the right password: a value only the token's holder could be given."""
+    return hmac.new(token.encode(), b'pdf2slides storage setup v1', hashlib.sha256).hexdigest()
+
+
+def _private(resp):
+    resp.headers['Cache-Control'] = 'no-store'
+    resp.headers['X-Robots-Tag'] = 'noindex, nofollow'
+    resp.headers['Referrer-Policy'] = 'no-referrer'
+    return resp
+
+
 @app.route('/setup', methods=['GET', 'POST'])
 def setup():
-    """One-time B2 bucket setup (CORS for browser uploads + auto-delete), using the master key."""
+    """
+    One-time B2 bucket setup (CORS for browser uploads + auto-delete), for the owner only.
+
+    The page exists only while SETUP_TOKEN is set on the server; otherwise this is a 404 like any
+    unknown address. With it set, nothing is shown or done until that token is entered: no
+    settings, no bucket name, no Backblaze request. Nothing on the site links here.
+    """
     import b2_admin
+
+    token = _setup_token()
+    if not token:
+        abort(404)
+    if request.method == 'POST' and 'password' in request.form:
+        if hmac.compare_digest(request.form.get('password', '').strip().encode(), token.encode()):
+            resp = redirect('/setup', code=303)
+            resp.set_cookie(SETUP_COOKIE, _setup_proof(token), max_age=SETUP_SESSION_SECONDS, httponly=True,
+                            secure=request.is_secure or ON_VERCEL, samesite='Strict', path='/setup')
+            return _private(resp)
+        time.sleep(1.5)  # slow down guessing
+        return _private(app.make_response((render_template('setup_login.html', wrong=True), 401)))
+    if not hmac.compare_digest(request.cookies.get(SETUP_COOKIE, '').encode(), _setup_proof(token).encode()):
+        return _private(app.make_response((render_template('setup_login.html', wrong=False), 401)))
 
     result = None
     if request.method == 'POST' and storage.enabled():
@@ -76,11 +122,9 @@ def setup():
             result['app_key_problem'] = b2_admin.check_app_key()
         except b2_admin.SetupError as exc:
             result = {'error': str(exc)}
-    resp = app.make_response(render_template(
+    return _private(app.make_response(render_template(
         'setup.html', env_checks=[(k, bool(os.environ.get(k))) for k in B2_SETTINGS], ready=storage.enabled(),
-        bucket=os.environ.get('B2_BUCKET', ''), result=result, max_mb=f'{storage.MAX_STORAGE_UPLOAD_MB:g}'))
-    resp.headers['Cache-Control'] = 'no-store'
-    return resp
+        bucket=os.environ.get('B2_BUCKET', ''), result=result, max_mb=f'{storage.MAX_STORAGE_UPLOAD_MB:g}')))
 
 
 @app.post('/upload-url')
@@ -156,8 +200,8 @@ def convert_route():
     opts = _options()
     mode = normalize_mode(opts.get('mode'))
     if PLANS[mode]['uses_llm'] and not condense.llm_available():
-        return jsonify(error=f'{PLANS[mode]["label"]} slides need an AI key. Set GROQ_API_KEY on the server, '
-                             'or choose Standard.'), 400
+        return jsonify(error=f'{PLANS[mode]["label"]} slides use AI, which is not switched on for this site. '
+                             'Choose Standard.'), 400
     theme = opts.get('theme') if opts.get('theme') in THEMES else DEFAULT_THEME
     title = (opts.get('title') or '').strip()[:120] or None
 

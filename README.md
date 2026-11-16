@@ -73,10 +73,17 @@ Vercel functions accept and return at most 4.5 MB. When B2 is configured, the br
 one-time upload link from `/upload-url` and uploads the PDF straight to a private B2 bucket (up to
 **100 MB**; the size is signed into the link, so B2 rejects anything else). The function downloads it,
 converts it, deletes it, and returns the deck as a download link that expires after 1 hour.
-Setup: create a private bucket and a bucket-limited Read and Write key in Backblaze, add the four
-`B2_*` variables in Vercel and redeploy, then open **`/setup`** on the site once and paste the account's
-master key. That sets the bucket's CORS rule (browser uploads) and auto-delete rules, and checks the
-app key. The master key is used for that request only and never stored.
+Setup: create a private bucket and a bucket-limited Read and Write key in Backblaze and add the four
+`B2_*` variables in Vercel. Then, to set the bucket's CORS rule (browser uploads) and auto-delete rules:
+
+1. Add `SETUP_TOKEN` in Vercel (a long random password, 16+ characters) and redeploy.
+2. Open `/setup`, enter that token, then paste the account's master key and run the setup.
+3. Remove `SETUP_TOKEN` and redeploy.
+
+The setup page is for the owner only. Without `SETUP_TOKEN` it does not exist (a 404 like any unknown
+address). With it, the page shows a password box and nothing else until the token is entered: no
+settings, no bucket name, and no request to Backblaze. Nothing on the site links to it. The master key
+is used for that request only and never stored.
 
 | Piece | File |
 |---|---|

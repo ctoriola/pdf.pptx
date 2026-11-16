@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Sign in</title>
+  {% include '_styles.html' %}
+</head>
+<body>
+<div class="wrap" style="max-width:520px;padding-top:12vh">
+  <main class="card">
+    <span class="pill">Owner only</span>
+    <h1 class="title" style="margin:18px 0 20px">Sign in</h1>
+    <form method="post" autocomplete="off" class="form-grid">
+      <label class="field">
+        <span>Password</span>
+        <input type="password" name="password" required autofocus spellcheck="false">
+      </label>
+      {% if wrong %}<p class="small warn" role="alert">That password is not correct.</p>{% endif %}
+      <button type="submit" class="submit" style="margin-top:4px">Continue <span class="go" aria-hidden="true">→</span></button>
+    </form>
+  </main>
+</div>
+</body>
+</html>

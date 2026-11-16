@@ -13,7 +13,6 @@
     <nav class="nav" aria-label="Main">
       <a href="/" aria-current="page">Convert</a>
       <a href="#how">How it works</a>
-      <a href="/setup">Storage setup</a>
     </nav>
     <div class="bar-end">
       <span class="pill">PDF to PowerPoint</span>
@@ -47,7 +46,7 @@
         </section>
         <section class="card forest" style="padding:22px">
           <p class="kicker" style="color:#fff">{% if llm_ready %}AI planner on{% else %}AI planner off{% endif %}</p>
-          <p class="small">{% if llm_ready %}Slide structure is reviewed by AI, with rules as the fallback.{% else %}Add an AI key on the server to plan structure and summarise with AI.{% endif %}</p>
+          <p class="small">{% if llm_ready %}Slide structure is reviewed by AI, with rules as the fallback.{% else %}Slides are structured by built-in rules. AI summaries are not switched on.{% endif %}</p>
         </section>
       </div>
     </div>
@@ -75,7 +74,7 @@
                 <span class="mode-body">
                   <span class="mode-title">{{ plan.label }}{% if plan.uses_llm %} <span class="tag">AI</span>{% endif %}</span>
                   <span class="mode-desc">{{ plan.description }}</span>
-                  {% if disabled %}<span class="mode-desc warn">Needs an AI key on the server (GROQ_API_KEY).</span>{% endif %}
+                  {% if disabled %}<span class="mode-desc warn">AI is not switched on for this site.</span>{% endif %}
                 </span>
               </label>
               {% endfor %}
@@ -314,7 +313,7 @@
       xhr.onload = () => xhr.status < 300 ? resolve()
         : reject(fail('The upload was refused by storage. Please try again.', xhr.status + ' ' + xhr.responseText));
       xhr.onerror = () => reject(fail('The upload could not reach storage. If this keeps happening, '
-                                      + 'the bucket setup has not been run yet (open /setup on this site).', 'network/CORS'));
+                                      + 'storage is not fully set up yet. Please try again later.', 'network/CORS'));
       xhr.send(file);
     });
     return { path: data.path };
