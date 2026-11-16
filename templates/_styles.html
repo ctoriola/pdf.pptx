@@ -120,15 +120,21 @@ legend { padding: 0; }
 .hint { font-size: 12px; color: var(--muted); margin: 0; }
 .drop .hint { color: var(--on-dark-muted); }
 
-.modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+.modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; padding-top: 6px; }
 .mode {
   position: relative; display: flex; flex-direction: column; gap: 8px; min-height: 148px;
   background: var(--tile); border-radius: var(--r-sm); padding: 16px; cursor: pointer;
-  transition: background .15s, color .15s;
+  transition: background .15s, color .15s, transform .18s ease, box-shadow .18s ease;
 }
 .mode input { position: absolute; opacity: 0; width: 1px; height: 1px; }
 .mode:hover { background: #e6e6e6; }
-.mode:has(input:checked) { background: var(--mint); color: var(--mint-ink); }
+/* the chosen type lifts off the row, so it is clear at a glance which one is selected */
+.mode:has(input:checked) {
+  background: var(--mint); color: var(--mint-ink);
+  transform: translateY(-6px);
+  box-shadow: 0 14px 26px -10px rgba(11, 42, 23, .45), 0 3px 8px rgba(11, 42, 23, .12);
+}
+@media (prefers-reduced-motion: reduce) { .mode { transition: background .15s, color .15s; } }
 .mode:has(input:focus-visible) { outline: 2px solid var(--ink); outline-offset: 2px; }
 .mode.disabled { opacity: .55; cursor: not-allowed; }
 .mode-body { display: flex; flex-direction: column; gap: 8px; height: 100%; }
@@ -216,7 +222,7 @@ code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 @media (max-width: 560px) {
   .wrap { padding: 12px 12px 40px; }
   .card { padding: 20px; border-radius: 22px; }
-  .modes { grid-template-columns: 1fr; }
+  .modes { grid-template-columns: 1fr; gap: 16px; }
   .mode { min-height: 0; }
   .row { grid-template-columns: 1fr; }
   .split { grid-template-columns: 1fr 1fr; }
