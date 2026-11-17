@@ -161,6 +161,7 @@
 <script>
 (() => {
   const MAX_MB = {{ max_upload_mb }};
+  const MAX_AI_WORDS = {{ max_ai_words }};  // Condensed and Detailed: words the AI rewrites at a time
   const DENSITY = {{ density | tojson }};  // long decks get fuller slides; see deck_builder.DENSE_AFTER
   const $ = id => document.getElementById(id);
   const form = $('form'), input = $('pdf'), drop = $('drop'), dropTitle = $('drop-title');
@@ -267,7 +268,7 @@
       const res = await fetch('/plan', { method: 'POST', body: requestBody() });
       if (!res.ok) return show('error', await errorText(res));
       const data = await res.json();
-      job.plan = data.plan; job.rows = data.sections;
+      job.plan = data.plan; job.rows = data.sections; job.markdownUrl = data.markdown_url || null;
       clearInterval(ticker); ticker = null;
       progress.hidden = true;
       renderPicker(data);
@@ -374,9 +375,13 @@
       }
       slides += Math.round(content) + extra;
     }
-    total.textContent = rows.length ? `About ${slides} slides · ${rows.length} of ${job.rows.length} sections`
-                                    : 'Choose at least one section';
-    buildBtn.disabled = !rows.length;
+    const words = rows.reduce((n, r) => n + (r.words || 0), 0);
+    const tooLong = job.mode !== 'standard' && words > MAX_AI_WORDS;
+    total.textContent = !rows.length ? 'Choose at least one section'
+      : tooLong ? `${words.toLocaleString()} words chosen: AI slide types rewrite up to ${MAX_AI_WORDS.toLocaleString()} at a time. Untick some sections or a chapter.`
+      : `About ${slides} slides · ${rows.length} of ${job.rows.length} sections`;
+    total.classList.toggle('warn', tooLong);
+    buildBtn.disabled = !rows.length || tooLong;
   }
 
   list.addEventListener('change', ev => {
@@ -407,7 +412,7 @@
         const data = await res.json();
         triggerDownload(data.download_url);
         dlPptx.href = data.download_url; dlPptx.removeAttribute('download');
-        markdownUrl = data.markdown_url || null;
+        markdownUrl = data.markdown_url || job.markdownUrl || null;
         show('done', 'Your slides are ready and downloading.',
              `${data.title} · ${data.slides} slides${planNote(data.kind, data.planner)} · links work for 1 hour`);
       } else {

@@ -36,9 +36,12 @@ and a chapter whose opening section is left out still gets its divider slide. In
 types, only the chosen sections are sent to the LLM.
 
 Vercel keeps nothing between requests, so step 1 hands the plan to the browser, which sends it
-back (gzip-compressed) with the choice. The server checks it, resolves images only inside that
-conversion's own folder, and reads the PDF again just for its images; no AI planning repeats. A
-PDF in B2 storage stays there between the steps and is deleted once the deck is built.
+back (gzip-compressed) with the choice. The server checks it and does not read the PDF again: the
+plan records where each picture sits on its page, so step 2 cuts only the chosen sections' pictures
+straight from their pages (one chapter of a 500-page textbook builds in under a second). Image
+paths stay inside that conversion's own folder, and no AI planning repeats. A PDF in B2 storage
+stays there between the steps and is deleted once the deck is built; the Markdown download is
+prepared in step 1, while the whole document is at hand.
 `POST /convert` still does both steps at once with every section.
 
 On the command line: `python convert.py report.pdf --list`, then `--sections 0,3-7,12`.
@@ -115,9 +118,23 @@ Without the four `B2_*` variables the app falls back to direct uploads:
 | 4.5 MB request body | PDFs over ~4.4 MB can't be uploaded | Checked in the browser and on the server, with a clear message |
 | 4.5 MB response body | Image-heavy decks could exceed it | The pictures inside the .pptx are recompressed in steps until it fits |
 
-Either way, the function stops after 300 seconds. Conversion takes about 0.2–0.5 s per page, so
-`MAX_PAGES` defaults to 300. The AI slide types have their own cap, `MAX_AI_PAGES` (default 120):
-they send the text to the LLM, whose free tier is rate-limited per minute.
+### Textbooks
+
+Either way, the function stops after 300 seconds, so the limits are set for a textbook to fit:
+
+| Setting | Default | Why |
+|---|---|---|
+| `MAX_PAGES` | 800 | Step 1 reads about 0.15–0.3 s a page (a 500-page test book: 91 s in total) |
+| `READ_TIME_LIMIT` | 240 s | Pages are read 40 at a time; past this, step 1 stops with "split it and convert the parts" instead of being cut off by Vercel |
+| `MAX_AI_WORDS` | 30,000 | Condensed and Detailed rewrite only the chosen sections, up to this many words (roughly 75–120 pages). The picker shows the count and says when to untick some. Standard has no such limit |
+| `MAX_OCR_PAGES` | 40 | Scanned pages take 1–3 s each; a scanned textbook needs splitting |
+| `MAX_STORAGE_UPLOAD_MB` | 100 | B2 uploads |
+
+Step 2 builds only the chosen sections, cut from the plan, so its time depends on the slides made,
+not the book's length (a 1,290-slide deck of the whole 500-page book: 28 s). python-pptx's part
+naming, which made each slide slower than the last, is replaced with a linear one in `deck_builder.py`.
+The plan sent to the browser is gzip-compressed (about a quarter of its size), keeping a long
+book's plan under Vercel's 4.5 MB response limit.
 
 On other hosts (Render, Railway, Fly.io) direct uploads default to 50 MB:
 
@@ -126,7 +143,7 @@ gunicorn -w 2 --timeout 300 -b 0.0.0.0:8000 app:app
 ```
 
 Settings: `MAX_UPLOAD_MB`, `MAX_RESPONSE_MB` (0 = no limit), `MAX_STORAGE_UPLOAD_MB`, `MAX_PAGES`,
-`MAX_AI_PAGES`.
+`READ_TIME_LIMIT`, `MAX_AI_WORDS`.
 
 ### Scanned PDFs (OCR)
 

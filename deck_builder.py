@@ -20,6 +20,45 @@ from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.oxml.ns import qn
 from pptx.util import Emu, Inches, Pt
+from pptx.opc.package import OpcPackage
+from pptx.opc.packuri import PackURI
+from pptx.package import Package
+
+
+# python-pptx names every new part (slide, notes page, picture) by walking the whole package to see
+# which names are taken. That makes each slide slower than the last: a 1,300-slide textbook deck
+# spent over a minute just naming parts. The same names, found from a set kept per package and
+# filled once: a part is only ever added under a name these two methods hand out.
+def _taken(package, prefix):
+    sets = package.__dict__.setdefault('_taken_partnames', {})
+    if prefix not in sets:
+        sets[prefix] = {str(p.partname) for p in package.iter_parts() if p.partname.startswith(prefix)}
+    return sets[prefix]
+
+
+def _next_partname(self, tmpl):
+    taken = _taken(self, tmpl[: (tmpl % 42).find('42')])
+    n = len(taken) + 1
+    while tmpl % n in taken:
+        n += 1
+    taken.add(tmpl % n)
+    return PackURI(tmpl % n)
+
+
+def _next_image_partname(self, ext):
+    taken = _taken(self, '/ppt/media/image')
+    used = self.__dict__.setdefault('_taken_image_idx', {PackURI(n).idx for n in taken})
+    n = len(used) + 1
+    while n in used:
+        n += 1
+    used.add(n)
+    name = f'/ppt/media/image{n}.{ext}'
+    taken.add(name)
+    return PackURI(name)
+
+
+OpcPackage.next_partname = _next_partname
+Package.next_image_partname = _next_image_partname
 
 from md_parse import inline_runs, list_labels, list_levels, plain, slice_list
 from semantics import content, get_meta, layout_of

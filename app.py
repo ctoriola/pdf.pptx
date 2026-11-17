@@ -32,6 +32,7 @@ import condense  # noqa: E402  (reads LLM settings from the environment loaded a
 import storage  # noqa: E402
 from deck_builder import DEFAULT_THEME, DENSE_AFTER, MAX_TEXT_FILL, TEXT_FILL, THEMES, shrink_pptx  # noqa: E402
 from pdf_to_md import PdfConversionError  # noqa: E402
+from pipeline import MAX_AI_WORDS  # noqa: E402
 from slide_plan import DEFAULT_MODE, PLANS, normalize_mode  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
@@ -63,7 +64,7 @@ def index():
     return render_template('index.html', plans=PLANS, default_mode=DEFAULT_MODE, themes=THEMES, density=density,
                            default_theme=DEFAULT_THEME, llm_ready=condense.llm_available(),
                            max_upload_mb=f'{storage.MAX_STORAGE_UPLOAD_MB if use_storage else MAX_UPLOAD_MB:g}',
-                           cloud_upload=use_storage)
+                           cloud_upload=use_storage, max_ai_words=MAX_AI_WORDS)
 
 
 B2_SETTINGS = ('B2_KEY_ID', 'B2_APPLICATION_KEY', 'B2_BUCKET', 'B2_ENDPOINT')
@@ -225,8 +226,16 @@ def plan_route():
             mode, _, title = _mode_and_options()
             pdf_path, filename, ctx = _receive_pdf(work)
             plan, rows, md_path = plan_pdf(pdf_path, work, mode, title, source_name=filename)
-            return jsonify(title=plan['title'], kind=plan['kind'], planner=plan['planner'], mode=mode,
-                           ocr_pages=plan['meta'].get('ocr_pages') or 0, sections=rows, plan=plan)
+            extra = {}
+            if ctx:
+                # Step 2 cuts only the chosen pictures and has no full Markdown, so the Markdown
+                # download is prepared here, while the whole document is at hand
+                zip_path = _zip_markdown(md_path, Path(work) / (Path(filename).stem + '_markdown.zip'))
+                extra['markdown_url'] = storage.upload_result(
+                    zip_path, f'outputs/{ctx["id"]}/{zip_path.name}', zip_path.name, 'application/zip')
+            return _gzipped(jsonify(title=plan['title'], kind=plan['kind'], planner=plan['planner'], mode=mode,
+                                    ocr_pages=plan['meta'].get('ocr_pages') or 0, sections=rows, plan=plan,
+                                    **extra))
         except InputError as exc:
             return jsonify(error=str(exc)), exc.status
         except (PdfConversionError, condense.LLMError) as exc:
@@ -236,7 +245,7 @@ def plan_route():
             return jsonify(error='Something went wrong while reading this PDF.'), 500
 
 
-MAX_PLAN_BYTES = 8 * 1024 * 1024
+MAX_PLAN_BYTES = 24 * 1024 * 1024  # a long textbook's plan, uncompressed
 
 
 def _read_plan():
@@ -284,10 +293,6 @@ def build_route():
                 raise InputError(str(exc))
             extra = {'title': deck_title, 'slides': slide_total, 'kind': plan.get('kind', ''),
                      'planner': plan.get('planner', '')}
-            if ctx:
-                zip_path = _zip_markdown(md_path, Path(work) / (pptx_path.stem + '_markdown.zip'))
-                extra['markdown_url'] = storage.upload_result(
-                    zip_path, f'outputs/{ctx["id"]}/{zip_path.name}', zip_path.name, 'application/zip')
             return _deliver(pptx_path, pptx_path.name, PPTX_MIME, ctx, extra)
         except InputError as exc:
             return jsonify(error=str(exc)), exc.status
@@ -340,6 +345,22 @@ def convert_route():
         finally:
             if ctx:
                 storage.delete(ctx['path'])  # the PDF is no longer needed
+
+
+def _gzipped(resp):
+    """
+    Compress a JSON response when the browser accepts it. A textbook's section plan is several MB
+    of text, over Vercel's 4.5 MB response limit, and compresses to about a quarter.
+    """
+    if 'gzip' not in request.headers.get('Accept-Encoding', '') or resp.direct_passthrough:
+        return resp
+    data = resp.get_data()
+    if len(data) < 1024:
+        return resp
+    resp.set_data(gzip.compress(data, 6))
+    resp.headers['Content-Encoding'] = 'gzip'
+    resp.headers['Vary'] = 'Accept-Encoding'
+    return resp
 
 
 def _zip_markdown(md_path, zip_path):

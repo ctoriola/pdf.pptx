@@ -5,6 +5,7 @@ End-to-end conversion: PDF -> Markdown (+images) -> sections -> [LLM] -> .pptx
 """
 import json
 import logging
+import os
 import re
 from pathlib import Path
 
@@ -88,6 +89,8 @@ def deck_title(md_title, pdf_path, override=None):
 PLAN_VERSION = 1
 BLOCK_TYPES = {'para', 'quote', 'sub', 'list', 'table', 'image', 'price', 'steps', 'meta', 'chapter'}
 MAX_PLAN_SECTIONS = 3000
+# Condensed and Detailed send the chosen text to the LLM, whose free tier is rate-limited per minute
+MAX_AI_WORDS = int(os.environ.get('MAX_AI_WORDS', 30000))
 
 
 def plan_from_markdown(md_path, mode='standard', title=None, pdf_path='document.pdf', progress=None):
@@ -116,19 +119,32 @@ def plan_from_markdown(md_path, mode='standard', title=None, pdf_path='document.
         pass
     log.info('%s: %d sections, %d words', title, len(sections), sum(word_count(b) for _, b in sections))
     base = md_path.parent.resolve()
+    boxes = _image_boxes(base)
     return {
         'v': PLAN_VERSION, 'title': title, 'kind': kind, 'planner': planned_by,
         'meta': {k: doc_meta.get(k, '') for k in ('kicker', 'subtitle', 'pages', 'ocr_pages')},
-        'sections': [{'name': name, 'blocks': [_portable(b, base) for b in blocks]} for name, blocks in sections],
+        'sections': [{'name': name, 'blocks': [_portable(b, base, boxes) for b in blocks]} for name, blocks in sections],
     }
 
 
-def _portable(block, base):
+def _image_boxes(base):
+    from pdf_to_md import BOXES_FILE
+    try:
+        return json.loads((Path(base) / BOXES_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _portable(block, base, boxes=None):
+    """A block for the plan: image paths relative to the Markdown folder, with where on which page the
+    picture is (so the build step can cut it from the PDF without reading the whole PDF again)."""
     if block['type'] == 'image':
         try:
-            return {**block, 'path': Path(block['path']).resolve().relative_to(base).as_posix()}
+            rel = Path(block['path']).resolve().relative_to(base).as_posix()
         except ValueError:
             return {**block, 'path': ''}
+        box = (boxes or {}).get(Path(rel).stem)
+        return {**block, 'path': rel, **({'box': box} if box else {})}
     return block
 
 
@@ -251,6 +267,13 @@ def build_from_plan(plan, md_dir, mode='standard', theme='coral', selected=None,
     sections = sections_from_plan(plan, md_dir, selected)
     if not sections:
         raise ValueError('Choose at least one section.')
+    if slide_plan['uses_llm']:
+        words = sum(word_count(b) for _, b in sections)
+        if words > MAX_AI_WORDS:
+            raise ValueError(
+                f'{slide_plan["label"]} slides rewrite up to {MAX_AI_WORDS:,} words at a time (roughly '
+                f'{MAX_AI_WORDS // 400}-{MAX_AI_WORDS // 250} pages), and the chosen sections have {words:,}. '
+                'Untick some sections, or choose Standard, which has no such limit.')
     title, meta, kind = plan.get('title') or 'Presentation', plan.get('meta') or {}, plan.get('kind') or 'document'
     if slide_plan['mode'] == 'condensed':
         sections = condense.condense_sections(title, sections, slide_plan, progress)
@@ -276,7 +299,37 @@ def read_pdf(pdf_path, work_dir, mode='standard', progress=None):
     from pdf_to_md import convert_pdf
     progress = progress or (lambda msg: None)
     progress('Reading the PDF (layout, text, tables and images)…')
-    return convert_pdf(pdf_path, Path(work_dir) / 'markdown', progress, uses_llm=get_plan(mode)['uses_llm'])
+    return convert_pdf(pdf_path, Path(work_dir) / 'markdown', progress)
+
+
+IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg'}
+
+
+def _image_jobs(plan, md_dir, selected):
+    """
+    [(page, bbox, destination)] for every picture in the selected sections, or None when any of them
+    cannot be cut from its page (no box recorded), in which case the PDF is read in full instead.
+    """
+    if not isinstance(plan, dict) or not isinstance(plan.get('sections'), list):
+        return None
+    base = Path(md_dir).resolve()
+    keep = None if selected is None else {i for i in selected if isinstance(i, int)}
+    jobs = {}
+    for i, s in enumerate(plan['sections'][:MAX_PLAN_SECTIONS]):
+        if keep is not None and i not in keep or not isinstance(s, dict) or not isinstance(s.get('blocks'), list):
+            continue
+        for b in s['blocks']:
+            if not isinstance(b, dict) or b.get('type') != 'image' or not b.get('path'):
+                continue
+            dest = (base / str(b['path'])).resolve()
+            box = b.get('box')
+            if base not in dest.parents or dest.suffix.lower() not in IMAGE_SUFFIXES:
+                continue  # sections_from_plan drops it too
+            if not (isinstance(box, list) and len(box) == 5 and isinstance(box[0], int)
+                    and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in box[1:])):
+                return None
+            jobs[dest] = (box[0], tuple(box[1:]), dest)
+    return list(jobs.values())
 
 
 def plan_pdf(pdf_path, work_dir, mode='standard', title=None, progress=None, source_name=None):
@@ -288,11 +341,23 @@ def plan_pdf(pdf_path, work_dir, mode='standard', title=None, progress=None, sou
 
 def build_pdf(pdf_path, work_dir, plan, mode='standard', theme='coral', selected=None, progress=None):
     """
-    Step 2 of 2: build the deck from a plan made earlier. The PDF is read again only to recover its
-    images (the plan holds the text, already repaired and arranged), so no AI planning repeats.
+    Step 2 of 2: build the deck from a plan made earlier. The plan holds the text, already repaired
+    and arranged, so no reading or AI planning repeats: only the pictures of the chosen sections
+    are cut again from their pages (milliseconds each, so a textbook builds as fast as a leaflet).
+    A plan without picture positions falls back to reading the whole PDF again.
     Returns (pptx_path, md_path, title, slide_total).
     """
-    md_path = read_pdf(pdf_path, work_dir, mode, progress)
+    from pdf_to_md import render_images
+    md_dir = Path(work_dir) / 'markdown'
+    jobs = _image_jobs(plan, md_dir, selected)
+    if jobs is None:
+        md_path = read_pdf(pdf_path, work_dir, mode, progress)
+    else:
+        if jobs:
+            (progress or (lambda msg: None))(f'Cutting {len(jobs)} picture(s) from the PDF…')
+            render_images(pdf_path, jobs)
+        md_dir.mkdir(parents=True, exist_ok=True)
+        md_path = md_dir / 'document.md'
     buffer, title, slide_total = build_from_plan(plan, md_path.parent, mode, theme, selected, progress)
     out = Path(work_dir) / (safe_filename(title) + '.pptx')
     out.write_bytes(buffer.getvalue())

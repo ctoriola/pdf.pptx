@@ -11,6 +11,7 @@ PDF itself (font sizes and page contents):
 import math
 import re
 from collections import Counter, defaultdict
+from pathlib import Path
 
 CHAPTER_MARK = '{.chapter}'
 DISPLAY_RATIO = 1.8        # a line this many times the body size is a display heading
@@ -300,10 +301,13 @@ def recover_missed_images(doc, chunks, img_dir, dpi=150):
     """
     The layout model sometimes fails to see a picture (a product photo inside a framed panel).
     Any sizeable region of embedded images that it did not mark as a picture is rendered from
-    the page and referenced in that page's text at its reading position.
+    the page and referenced in that page's text at its reading position. Returns {file name: (page
+    index, bbox)} for the pictures it saved.
     """
     import pymupdf
-    for n, chunk in enumerate(chunks):
+    saved = {}
+    for i, chunk in enumerate(chunks):
+        n = chunk_page(chunk, i)
         page = doc[n]
         area = abs(page.rect)
         rects = []
@@ -331,11 +335,41 @@ def recover_missed_images(doc, chunks, img_dir, dpi=150):
             at = max((b['pos'][1] for b in above), default=0)
             path = f'{img_dir}/missed-{n + 1:04d}-{k:02d}.png'
             page.get_pixmap(clip=reg, dpi=dpi).save(path)
+            saved[Path(path).name] = (n, tuple(reg))
             inserts.append((at, f'\n\n![]({path})\n\n'))
         for at, ref in sorted(inserts, reverse=True):
             text = text[:at] + ref + text[at:]
         chunk['text'] = text
-    return chunks
+    return saved
+
+
+def chunk_page(chunk, i):
+    """The 0-based page index of a pymupdf4llm page chunk (its i-th chunk when it does not say)."""
+    number = (chunk.get('metadata') or {}).get('page_number')
+    return number - 1 if isinstance(number, int) and number > 0 else i
+
+
+PICTURE_NAME = re.compile(r'-(\d{4})-(\d{2})\.png$')
+
+
+def image_boxes(chunks, img_dir, saved=None):
+    """
+    Where on its page each saved picture came from: {file name: (page index, bbox)}. pymupdf4llm
+    names a picture <pdf>-<page number>-<box index>.png, the box being one of that page's layout
+    boxes; the picture is that box rendered. Knowing the box, a picture can be cut from the page
+    again later without running the layout model.
+    """
+    by_page = {chunk_page(c, i) + 1: c.get('page_boxes') or [] for i, c in enumerate(chunks)}
+    out = dict(saved or {})
+    for f in Path(img_dir).iterdir():
+        m = PICTURE_NAME.search(f.name)
+        if not m or f.name in out:
+            continue
+        boxes = by_page.get(int(m.group(1)), [])
+        k = int(m.group(2))
+        if k < len(boxes) and boxes[k].get('bbox'):
+            out[f.name] = (int(m.group(1)) - 1, tuple(boxes[k]['bbox']))
+    return out
 
 
 def assemble(page_texts, info):

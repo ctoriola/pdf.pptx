@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 from PIL import Image, ImageStat
@@ -31,17 +32,20 @@ LOGO_MAX_PX = 400           # at 150 dpi, under ~2.7in: small enough to be a hea
 BANNER_ASPECT = 2.5         # this much wider than tall (or taller than wide) reads as a banner
 DUPLICATE_DISTANCE = 6      # perceptual-hash bits that may differ between copies of one picture
 MAX_IMAGE_PX = 1600         # longest side after recompression
-MAX_PAGES = int(os.environ.get('MAX_PAGES', 300))        # about 0.2-0.5 s/page; Vercel allows 300 s
-# The AI slide types send the text to the LLM, whose free tier is rate-limited per minute,
-# so they stop being able to finish inside one request well before Standard does
-MAX_AI_PAGES = int(os.environ.get('MAX_AI_PAGES', 120))
+# Reading takes about 0.15-0.3 s a page, and the build step no longer re-reads the PDF (it cuts the
+# chosen pictures straight from their pages), so a ~800-page textbook fits Vercel's 300 s
+MAX_PAGES = int(os.environ.get('MAX_PAGES', 800))
+# Pages are read in batches; past this many seconds of reading, the conversion stops with a clear
+# message instead of being cut off by the host (Vercel ends a function at 300 s)
+READ_TIME_LIMIT = float(os.environ.get('READ_TIME_LIMIT', 240))
+READ_BATCH = 40
 
 
 class PdfConversionError(Exception):
     """The PDF could not be converted (corrupt, encrypted, too long, no text)."""
 
 
-def convert_pdf(pdf_path, out_dir, progress=None, uses_llm=False):
+def convert_pdf(pdf_path, out_dir, progress=None):
     """
     Convert a PDF. Returns the path of the written Markdown file; images are saved
     under out_dir/images and referenced as images/<name> relative to the Markdown file.
@@ -54,6 +58,7 @@ def convert_pdf(pdf_path, out_dir, progress=None, uses_llm=False):
     img_dir.mkdir(parents=True, exist_ok=True)
     md_path = out_dir / 'document.md'
     progress = progress or (lambda msg: None)
+    started = time.monotonic()
 
     try:
         doc = pymupdf.open(str(pdf_path))
@@ -64,10 +69,6 @@ def convert_pdf(pdf_path, out_dir, progress=None, uses_llm=False):
             raise PdfConversionError('This PDF is password-protected. Remove the password and try again.')
         if doc.page_count > MAX_PAGES:
             raise PdfConversionError(f'This PDF has {doc.page_count} pages; the limit is {MAX_PAGES}.')
-        if uses_llm and doc.page_count > MAX_AI_PAGES:
-            raise PdfConversionError(
-                f'This PDF has {doc.page_count} pages. The AI slide types (Condensed and Detailed) handle up to '
-                f'{MAX_AI_PAGES} pages; choose Standard, which handles up to {MAX_PAGES}.')
         meta_title = (doc.metadata or {}).get('title', '')
         # Scanned pages (pictures of text) get an invisible text layer first, so everything below
         # treats them like any other page
@@ -88,16 +89,31 @@ def convert_pdf(pdf_path, out_dir, progress=None, uses_llm=False):
             log.warning('%d scanned pages, but no OCR language data in %s', len(scanned), ocr.TESSDATA)
         try:
             info = pdf_structure.analyze(src)
-            chunks = pymupdf4llm.to_markdown(
-                src, write_images=True, image_path=str(img_dir), image_format='png', dpi=RENDER_DPI,
-                header=False, footer=False, use_ocr=False, show_progress=False, page_chunks=True)
+            chunks = []
+            for first in range(0, src.page_count, READ_BATCH):
+                if chunks and time.monotonic() - started > READ_TIME_LIMIT:
+                    raise PdfConversionError(
+                        f'This PDF is too long to read in one go here: {first} of its {src.page_count} pages '
+                        f'were read in the time allowed. Split it (for example by part or chapter) and convert '
+                        f'the parts.')
+                if src.page_count > READ_BATCH:
+                    progress(f'Reading pages {first + 1}-{min(first + READ_BATCH, src.page_count)} '
+                             f'of {src.page_count}…')
+                chunks += pymupdf4llm.to_markdown(
+                    src, pages=list(range(first, min(first + READ_BATCH, src.page_count))),
+                    write_images=True, image_path=str(img_dir), image_format='png', dpi=RENDER_DPI,
+                    header=False, footer=False, use_ocr=False, show_progress=False, page_chunks=True)
+        except PdfConversionError:
+            raise
         except Exception as exc:
             log.exception('pymupdf4llm failed')
             raise PdfConversionError(f'Could not read this PDF: {exc}') from exc
         try:
-            pdf_structure.recover_missed_images(src, chunks, str(img_dir), RENDER_DPI)
+            saved = pdf_structure.recover_missed_images(src, chunks, str(img_dir), RENDER_DPI)
         except Exception:  # a safety net only: never fail a conversion over it
             log.exception('Recovering missed images failed')
+            saved = {}
+        boxes = pdf_structure.image_boxes(chunks, img_dir, saved)
         if src is not doc:
             src.close()
 
@@ -117,7 +133,53 @@ def convert_pdf(pdf_path, out_dir, progress=None, uses_llm=False):
                                      'The scan may be too faint or blurred.')
         raise PdfConversionError('No readable text was found in this PDF.')
     md_path.write_text(text, encoding='utf-8')
+    # where each picture still in use came from, so the build step can cut it again (render_images)
+    used = {Path(m.group('path')).stem for m in map(IMAGE_RE.match, map(str.strip, text.split('\n'))) if m}
+    (out_dir / BOXES_FILE).write_text(json.dumps(
+        {Path(name).stem: [page, *[round(v, 2) for v in bbox]] for name, (page, bbox) in boxes.items()
+         if Path(name).stem in used}))
     return md_path
+
+
+BOXES_FILE = 'image_boxes.json'
+
+
+def render_images(pdf_path, jobs):
+    """
+    Cut pictures from their pages again: jobs is [(page index, bbox, destination path)]. The same
+    render as the first read (RENDER_DPI), resized and saved as the destination's type, so the
+    build step needs neither the layout model nor OCR. Returns how many were written.
+    """
+    import pymupdf
+    done = 0
+    try:
+        doc = pymupdf.open(str(pdf_path))
+    except Exception as exc:
+        raise PdfConversionError('This file could not be opened as a PDF.') from exc
+    with doc:
+        for page_no, bbox, dest in jobs:
+            if not (isinstance(page_no, int) and 0 <= page_no < doc.page_count):
+                continue
+            page = doc[page_no]
+            clip = pymupdf.Rect(bbox) & page.rect
+            if clip.is_empty or clip.width < 2 or clip.height < 2:
+                continue
+            dest = Path(dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            img = Image.frombytes('RGB', *_pixmap(page, clip))
+            if max(img.size) > MAX_IMAGE_PX:
+                img.thumbnail((MAX_IMAGE_PX, MAX_IMAGE_PX), Image.LANCZOS)
+            if dest.suffix.lower() in ('.jpg', '.jpeg'):
+                img.save(dest, 'JPEG', quality=85, optimize=True)
+            else:
+                img.save(dest, 'PNG', optimize=True)
+            done += 1
+    return done
+
+
+def _pixmap(page, clip):
+    pix = page.get_pixmap(clip=clip, dpi=RENDER_DPI, alpha=False)
+    return (pix.width, pix.height), pix.samples
 
 
 def choose_title(meta_title, cover_title):

@@ -766,6 +766,7 @@ def test_text_per_slide_is_halved():
 import pdf_structure  # noqa: E402
 
 HANDBOOK = FIXTURES / 'handbook.pdf'
+BROCHURE_PDF = FIXTURES / 'brochure.pdf'
 
 
 def test_chapters_and_title_are_read_from_font_sizes():
@@ -914,20 +915,29 @@ def test_repeated_banner_graphics_are_dropped(tmp_path):
 
 
 def test_page_limits(tmp_path, monkeypatch):
-    """Standard takes long PDFs; the AI slide types have a lower cap with a message pointing to Standard."""
+    """Textbook-length PDFs are read in every slide type; the page cap still applies."""
     import pymupdf
-    assert pdf_to_md.MAX_PAGES >= 300
+    assert pdf_to_md.MAX_PAGES >= 800
     doc = pymupdf.open()
     for n in range(6):
         doc.new_page().insert_textbox((60, 60, 520, 700), f'Page {n} body text about first aid and care. ' * 20, fontsize=10)
     doc.save(tmp_path / 'six.pdf')
-    monkeypatch.setattr(pdf_to_md, 'MAX_AI_PAGES', 5)
-    assert pdf_to_md.convert_pdf(tmp_path / 'six.pdf', tmp_path / 'a').exists()  # Standard: fine
-    with pytest.raises(pdf_to_md.PdfConversionError, match='choose Standard'):
-        pdf_to_md.convert_pdf(tmp_path / 'six.pdf', tmp_path / 'b', uses_llm=True)
+    assert pdf_to_md.convert_pdf(tmp_path / 'six.pdf', tmp_path / 'a').exists()
     monkeypatch.setattr(pdf_to_md, 'MAX_PAGES', 5)
     with pytest.raises(pdf_to_md.PdfConversionError, match='the limit is 5'):
         pdf_to_md.convert_pdf(tmp_path / 'six.pdf', tmp_path / 'c')
+
+
+def test_ai_slide_types_are_limited_by_the_words_chosen(tmp_path, monkeypatch):
+    """Condensed/Detailed cap the text sent to the LLM, not the PDF's length: pick a chapter of a textbook."""
+    import pipeline
+    from pipeline import build_from_plan, plan_from_markdown
+    md = pdf_to_md.convert_pdf(HANDBOOK, tmp_path / 'md')
+    plan = plan_from_markdown(md, 'standard')
+    monkeypatch.setattr(pipeline, 'MAX_AI_WORDS', 50)
+    with pytest.raises(ValueError, match='rewrite up to 50 words.*Untick some sections'):
+        build_from_plan(plan, md.parent, 'condensed')
+    build_from_plan(plan, md.parent, 'standard')  # Standard has no such limit
 
 
 # ---------- LLM client: retired models, rotation ----------
@@ -1138,13 +1148,15 @@ def test_missed_images_are_recovered(tmp_path):
     chunks = [{'text': 'HEADING\n\nBody text.', 'page_boxes': [
         {'class': 'section-header', 'bbox': (60, 100, 300, 130), 'pos': (0, 7)},
         {'class': 'text', 'bbox': (60, 500, 500, 520), 'pos': (9, 19)}]}]
-    pdf_structure.recover_missed_images(doc, chunks, str(tmp_path))
+    saved = pdf_structure.recover_missed_images(doc, chunks, str(tmp_path))
     text = chunks[0]['text']
     assert text.index('HEADING') < text.index('![](') < text.index('Body text.')
     assert (tmp_path / 'missed-0001-00.png').is_file()
+    page_no, box = saved['missed-0001-00.png']  # where to cut it again: the picture as placed on the page
+    assert page_no == 0 and pymupdf.Rect(60, 199, 500, 421).contains(pymupdf.Rect(box)) and box[2] - box[0] > 200
     # a region the model already captured as a picture or table is left alone
     seen = [{'text': 'x', 'page_boxes': [{'class': 'table', 'bbox': (60, 200, 500, 420), 'pos': (0, 1)}]}]
-    assert '![](' not in pdf_structure.recover_missed_images(doc, seen, str(tmp_path))[0]['text']
+    assert pdf_structure.recover_missed_images(doc, seen, str(tmp_path)) == {} and '![](' not in seen[0]['text']
 
 
 def test_ai_modes_leave_product_and_process_slides_alone(brochure_md, monkeypatch):
@@ -1508,3 +1520,93 @@ def test_ocr_noise_is_dropped():
         assert ocr._is_noise(junk)
     for keep in ('1', '02', 'MS-5', 'Send an enquiry', 'Be Safe'):
         assert not ocr._is_noise(keep)
+
+
+# ---------- textbooks: the build step cuts only the chosen pictures ----------
+def test_plan_records_where_each_picture_is(tmp_path):
+    from pipeline import plan_from_markdown
+    md = pdf_to_md.convert_pdf(BROCHURE_PDF, tmp_path / 'md')
+    plan = plan_from_markdown(md, 'standard')
+    images = [b for s in plan['sections'] for b in s['blocks'] if b['type'] == 'image']
+    assert images and all(len(b['box']) == 5 and isinstance(b['box'][0], int) for b in images)
+
+
+def test_build_cuts_chosen_pictures_without_reading_the_pdf_again(tmp_path, monkeypatch):
+    import pipeline
+    from pipeline import build_pdf, plan_pdf
+    plan, rows, md = plan_pdf(BROCHURE_PDF, tmp_path / 'one', 'standard')
+    first = {p.name: Image.open(p).size for p in (md.parent / 'images').iterdir()}
+    with_pic = [r['id'] for r in rows if r['images']]
+    assert with_pic
+
+    def no_reading(*a, **k):
+        raise AssertionError('the PDF was read again')
+    monkeypatch.setattr(pipeline, 'read_pdf', no_reading)
+    pptx, _, _, slides = build_pdf(BROCHURE_PDF, tmp_path / 'two', plan, 'standard', selected=with_pic[:1])
+    cut = {p.name: Image.open(p).size for p in (tmp_path / 'two' / 'markdown' / 'images').iterdir()}
+    chosen = {Path(b['path']).name for b in plan['sections'][with_pic[0]]['blocks'] if b['type'] == 'image'}
+    assert set(cut) == chosen  # only the chosen section's pictures, under the plan's names
+    for name, size in cut.items():
+        assert abs(size[0] - first[name][0]) <= 3 and abs(size[1] - first[name][1]) <= 3
+    pics = [sh for s in Presentation(str(pptx)).slides for sh in s.shapes if sh.shape_type == 13]
+    assert len(pics) >= len(chosen)
+
+
+def test_build_without_picture_positions_reads_the_pdf_again(tmp_path):
+    from pipeline import build_pdf, plan_pdf
+    plan, rows, _ = plan_pdf(BROCHURE_PDF, tmp_path / 'one', 'standard')
+    for s in plan['sections']:
+        for b in s['blocks']:
+            b.pop('box', None)  # a plan made before positions were recorded
+    pptx, _, _, _ = build_pdf(BROCHURE_PDF, tmp_path / 'two', plan, 'standard')
+    assert any(sh.shape_type == 13 for s in Presentation(str(pptx)).slides for sh in s.shapes)
+
+
+def test_picture_cutting_stays_inside_the_conversion_folder(tmp_path):
+    from pipeline import _image_jobs
+    plan = {'sections': [{'name': 'x', 'blocks': [
+        {'type': 'image', 'path': '../../evil.png', 'box': [0, 0, 0, 50, 50]},
+        {'type': 'image', 'path': 'images/a.exe', 'box': [0, 0, 0, 50, 50]},
+        {'type': 'image', 'path': 'images/ok.png', 'box': [0, 0, 0, 50, 50]}]}]}
+    jobs = _image_jobs(plan, tmp_path, None)
+    assert [j[2].name for j in jobs] == ['ok.png']
+    plan['sections'][0]['blocks'][2]['box'] = ['0', 'a', 1, 2, 3]  # damaged: fall back to a full read
+    assert _image_jobs(plan, tmp_path, None) is None
+    count = pdf_to_md.render_images(SAMPLE_PDF, [(999, (0, 0, 9, 9), tmp_path / 'images' / 'x.png'),
+                                                  (0, (0, 0, 120, 90), tmp_path / 'images' / 'y.jpg')])
+    assert count == 1 and Image.open(tmp_path / 'images' / 'y.jpg').format == 'JPEG'
+
+
+def test_plan_response_is_compressed(client):
+    import gzip
+    with open(HANDBOOK, 'rb') as f:
+        res = client.post('/plan', data={'pdf': (f, 'handbook.pdf'), 'mode': 'standard'},
+                          headers={'Accept-Encoding': 'gzip, deflate'})
+    assert res.status_code == 200 and res.headers['Content-Encoding'] == 'gzip'
+    assert json.loads(gzip.decompress(res.data))['sections']
+
+
+def test_long_reads_stop_with_a_clear_message(tmp_path, monkeypatch):
+    monkeypatch.setattr(pdf_to_md, 'READ_BATCH', 3)
+    steps = []
+    md = pdf_to_md.convert_pdf(HANDBOOK, tmp_path / 'a', steps.append)  # read in batches of 3 pages
+    assert 'Reading pages 4-6 of 7…' in steps and '## Care for Adults (18 and Over) {.chapter}' in md.read_text()
+    monkeypatch.setattr(pdf_to_md, 'READ_TIME_LIMIT', 0)
+    with pytest.raises(pdf_to_md.PdfConversionError, match='3 of its 7 pages were read.*Split it'):
+        pdf_to_md.convert_pdf(HANDBOOK, tmp_path / 'b')
+
+
+def test_big_decks_get_unique_part_names(tmp_path):
+    """python-pptx part naming is replaced by a faster one: names must stay unique and the file valid."""
+    import zipfile
+    from collections import Counter
+    from deck_builder import build_deck
+    photo = str(FIXTURES / 'images' / 'photo2.png')
+    sections = [(f'Section {n}', [{'type': 'para', 'text': 'Body text for this section. ' * 30},
+                                  {'type': 'image', 'path': photo, 'caption': ''}]) for n in range(40)]
+    buf, slides = build_deck('Big', sections)
+    (tmp_path / 'big.pptx').write_bytes(buf.getvalue())
+    names = zipfile.ZipFile(tmp_path / 'big.pptx').namelist()
+    assert not [n for n, c in Counter(names).items() if c > 1]
+    assert len(Presentation(str(tmp_path / 'big.pptx')).slides) == slides >= 40
+    assert sum(n.startswith('ppt/media/image') for n in names) >= 1
