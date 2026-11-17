@@ -1371,6 +1371,9 @@ _theme_lock = threading.Lock()
 AGENDA_RANGE = (3, 14)
 
 
+ESTIMATE_DECK_SLIDES = 150
+
+
 def estimate_slides(sections, one_slide_per_section=False):
     """
     Slides each section would make on its own (split at its sub-headings, as in a real build;
@@ -1384,6 +1387,11 @@ def estimate_slides(sections, one_slide_per_section=False):
         _drawing_pictures = False  # the layout only needs each picture's size
         try:
             for name, blocks in sections:
+                if len(builder.prs.slides) > ESTIMATE_DECK_SLIDES:
+                    # python-pptx gets slower with every slide in a deck (it searches all of them to
+                    # link the next one); a fresh scratch deck keeps a 3,000-page book linear
+                    page, builder = builder.page, DeckBuilder('estimate', one_slide_per_section=one_slide_per_section)
+                    builder.page = page
                 before = builder.page
                 parts = [(name, blocks)] if one_slide_per_section else split_long_sections([(name, blocks)])
                 for part_name, part in parts:

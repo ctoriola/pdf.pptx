@@ -148,6 +148,11 @@ browser ──/plan──▶ "needs parts": the book cut into 300-page parts (sa
 | `MAX_OCR_PAGES` / `OCR_BATCH` | 40 / 30 | Scanned pages take 1–3 s each: past 40, the browser has them read in batches of 30, four requests at a time |
 | `MAX_STORAGE_UPLOAD_MB` | 200 | B2 uploads |
 
+Measured on a 2,105-page, 92 MB test book (here, one request at a time; Vercel may be slower):
+each 300-page part took 47–88 s and sends back 0.16 MB; the final plan took 57 s (505 sections,
+409 chapters) from a 1.1 MB request, and returns a 0.9 MB plan; building one chapter took 0.1 s.
+With four parts at once, step 1 is about 3–4 minutes for a book that size.
+
 Step 2 builds only the chosen sections, so its time depends on the slides made, not the book's
 length. python-pptx's part naming, which made each slide slower than the last, is replaced with a
 linear one in `deck_builder.py`. Plans and parts travel gzip-compressed, keeping them under
