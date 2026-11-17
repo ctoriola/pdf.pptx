@@ -8,6 +8,7 @@ Tesseract's language data, shipped in ./tessdata (English, "fast" model, Apache 
 languages: add their .traineddata files there and list them in OCR_LANGUAGES, e.g. "eng+fra".
 """
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -16,7 +17,8 @@ log = logging.getLogger(__name__)
 TESSDATA = Path(os.environ.get('OCR_TESSDATA') or Path(__file__).resolve().parent / 'tessdata')
 LANGUAGES = os.environ.get('OCR_LANGUAGES', 'eng')
 OCR_DPI = int(os.environ.get('OCR_DPI', 200))           # 200 reads printed text well and is quick
-MAX_OCR_PAGES = int(os.environ.get('MAX_OCR_PAGES', 40))  # ~1-3 s a page, read in both steps; Vercel allows 300 s
+MAX_OCR_PAGES = int(os.environ.get('MAX_OCR_PAGES', 40))  # read in one request (~1-3 s a page; Vercel allows 300 s)
+OCR_BATCH = int(os.environ.get('OCR_BATCH', 30))         # more than that: the browser sends batches of this many
 MIN_TEXT_CHARS = 40          # a page with less real text than this...
 MIN_IMAGE_SHARE = 0.4        # ...and a picture covering this much of it is a scan
 
@@ -106,22 +108,74 @@ def ocr_page_lines(page):
     return sorted(lines, key=lambda line: (line[3], line[0].x0))
 
 
-def make_searchable(doc, pages, progress=None):
+def read_pages(doc, pages, progress=None):
     """
-    A copy of doc in which each of `pages` carries an invisible text layer with the recognised
-    text, one line at a time at that line's size, over the unchanged picture. Other pages are
-    copied as they are.
+    OCR the given pages: {page index: [[x0, baseline, size, text], ...]}, one entry per line. Plain
+    JSON, so pages read in separate requests (a scanned textbook, in batches) can be put together.
     """
-    import pymupdf
-
     progress = progress or (lambda msg: None)
-    out = pymupdf.open()
-    out.insert_pdf(doc)
+    out = {}
     for k, n in enumerate(pages, 1):
         progress(f'Reading scanned page {k} of {len(pages)} (OCR)…')
+        out[n] = [[round(bbox.x0, 2), round(base, 2), round(size, 2), text]
+                  for bbox, text, size, base in ocr_page_lines(doc[n])]
+    return out
+
+
+def apply_lines(doc, lines):
+    """
+    A copy of doc in which each page in `lines` carries an invisible text layer with the recognised
+    text, one line at a time at that line's size, over the unchanged picture.
+    """
+    import pymupdf
+    out = pymupdf.open()
+    out.insert_pdf(doc)
+    for n, page_lines in lines.items():
         page = out[n]
-        for bbox, text, size, base in ocr_page_lines(doc[n]):
+        for x0, base, size, text in page_lines:
             # invisible text (render mode 3): searchable and extractable, nothing drawn
-            page.insert_text((bbox.x0, base), text, fontsize=max(4.0, size), fontname='helv', render_mode=3)
-    log.info('OCR: %d of %d pages', len(pages), doc.page_count)
+            page.insert_text((x0, base), text, fontsize=max(4.0, size), fontname='helv', render_mode=3)
+    log.info('OCR text layer on %d of %d pages', len(lines), doc.page_count)
+    return out
+
+
+def make_searchable(doc, pages, progress=None):
+    """OCR `pages` and return a copy of doc with their text layer."""
+    return apply_lines(doc, read_pages(doc, pages, progress))
+
+
+MAX_LINES_PER_PAGE = 600
+MAX_LINE_CHARS = 1000
+
+
+def clean_lines(data, doc, allowed):
+    """
+    OCR results sent back by the browser, checked: only pages in `allowed` (the scanned pages),
+    numbers clamped to the page, text capped. Anything malformed is dropped (that page is read again).
+    """
+    out = {}
+    if not isinstance(data, dict):
+        return out
+    for key, page_lines in list(data.items())[:5000]:
+        try:
+            n = int(key)
+        except (TypeError, ValueError):
+            continue
+        if n not in allowed or not isinstance(page_lines, list):
+            continue
+        rect = doc[n].rect
+        good = []
+        for line in page_lines[:MAX_LINES_PER_PAGE]:
+            if not (isinstance(line, list) and len(line) == 4 and isinstance(line[3], str)
+                    and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                            for v in line[:3])):
+                good = None
+                break
+            x0, base, size, text = line
+            text = ' '.join(text.split())[:MAX_LINE_CHARS]
+            if text:
+                good.append([min(max(x0, 0), rect.width), min(max(base, 0), rect.height),
+                             min(max(size, 4), 200), text])
+        if good is not None:
+            out[n] = good
     return out

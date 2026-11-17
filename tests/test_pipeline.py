@@ -341,6 +341,12 @@ class FakeB2:
     def delete(self, path):
         self.deleted.append(path)
 
+    def put(self, local, path, content_type='application/pdf'):
+        import tempfile
+        keep = Path(tempfile.mkdtemp()) / Path(path).name
+        shutil.copy(local, keep)
+        self.uploads[path] = keep
+
 
 @pytest.fixture
 def cloud(monkeypatch):
@@ -351,6 +357,7 @@ def cloud(monkeypatch):
     monkeypatch.setattr(storage, 'download', fake.download)
     monkeypatch.setattr(storage, 'upload_result', fake.upload_result)
     monkeypatch.setattr(storage, 'delete', fake.delete)
+    monkeypatch.setattr(storage, 'put', fake.put)
     import app as webapp
     return webapp.app.test_client(), fake
 
@@ -363,7 +370,7 @@ def test_upload_url_signs_size_and_enforces_limit(cloud):
     assert storage.UPLOAD_PATH_RE.match(data['path'])
     assert data['url'].startswith('https://s3.us-east-005.backblazeb2.com/my-bucket/uploads/')
     assert 'X-Amz-SignedHeaders=content-length%3Bcontent-type%3Bhost' in data['url']
-    assert client.post('/upload-url', json={'size': 101 * 1024 * 1024}).status_code == 400
+    assert client.post('/upload-url', json={'size': 201 * 1024 * 1024}).status_code == 400
     assert client.post('/upload-url', json={}).status_code == 400
 
 
@@ -391,10 +398,10 @@ def test_cloud_rejects_bad_paths(cloud):
     assert fake.outputs == {}
 
 
-def test_cloud_page_mentions_100mb(cloud):
+def test_cloud_page_mentions_200mb(cloud):
     client, _ = cloud
     html = client.get('/').data.decode()
-    assert 'window.cloudUpload' in html and 'Up to 100 MB' in html
+    assert 'window.cloudUpload' in html and 'Up to 200 MB' in html
 
 
 def test_page_without_b2_uses_direct_upload(client):
@@ -1508,7 +1515,7 @@ def test_scanned_deck_end_to_end(tmp_path):
 def test_ocr_limits_and_missing_language_data(tmp_path, monkeypatch):
     scan = scanned_copy(HANDBOOK, tmp_path / 'scan.pdf')
     monkeypatch.setattr(ocr, 'MAX_OCR_PAGES', 3)
-    with pytest.raises(pdf_to_md.PdfConversionError, match='7 scanned pages.*up to 3 at a time'):
+    with pytest.raises(pdf_to_md.PdfConversionError, match='7 scanned pages; one request reads up to 3.*Split'):
         pdf_to_md.convert_pdf(scan, tmp_path / 'a')
     monkeypatch.setattr(ocr, 'TESSDATA', tmp_path / 'no-tessdata')
     with pytest.raises(pdf_to_md.PdfConversionError, match='No readable text was found in this PDF'):
@@ -1610,3 +1617,75 @@ def test_big_decks_get_unique_part_names(tmp_path):
     assert not [n for n, c in Counter(names).items() if c > 1]
     assert len(Presentation(str(tmp_path / 'big.pptx')).slides) == slides >= 40
     assert sum(n.startswith('ppt/media/image') for n in names) >= 1
+
+
+# ---------- scanned textbooks: OCR in batches across requests ----------
+def _unzip(res):
+    import gzip
+    return json.loads(gzip.decompress(res.data)) if res.headers.get('Content-Encoding') == 'gzip' else res.json
+
+
+def test_scanned_book_is_read_in_batches_direct_upload(client, tmp_path, monkeypatch):
+    import gzip
+    import io
+    scan = scanned_copy(HANDBOOK, tmp_path / 'scan.pdf')
+    monkeypatch.setattr(ocr, 'MAX_OCR_PAGES', 3)
+    monkeypatch.setattr(ocr, 'OCR_BATCH', 3)
+    with open(scan, 'rb') as f:
+        res = client.post('/plan', data={'pdf': (f, 'scan.pdf'), 'mode': 'standard'})
+    data = _unzip(res)
+    assert res.status_code == 200 and data['needs_ocr'] and data['pages'] == 7
+    assert [b['pages'] for b in data['batches']] == [[0, 1, 2], [3, 4, 5], [6]]
+    lines = {}
+    for batch in data['batches']:  # what the browser does, several at once
+        with open(scan, 'rb') as f:
+            res = client.post('/ocr', data={'pdf': (f, 'scan.pdf'), 'pages': ','.join(map(str, batch['pages']))})
+        assert res.status_code == 200, res.data[:200]
+        lines.update(_unzip(res)['lines'])
+    assert sorted(map(int, lines)) == list(range(7))
+    with open(scan, 'rb') as f:
+        res = client.post('/plan', data={'pdf': (f, 'scan.pdf'), 'mode': 'standard',
+                                         'ocr': (io.BytesIO(gzip.compress(json.dumps(lines).encode())), 'ocr.json.gz')})
+    data = _unzip(res)
+    assert res.status_code == 200 and not data.get('needs_ocr'), data
+    names = [r['name'] for r in data['sections']]
+    assert 'General Concepts of First Aid' in names and data['ocr_pages'] == 7
+
+
+def test_scanned_book_batches_go_through_cloud_storage(cloud, tmp_path, monkeypatch):
+    client, fake = cloud
+    scan = scanned_copy(HANDBOOK, tmp_path / 'scan.pdf')
+    monkeypatch.setattr(ocr, 'MAX_OCR_PAGES', 2)
+    monkeypatch.setattr(ocr, 'OCR_BATCH', 4)
+    upload = 'uploads/' + 'cd' * 16 + '.pdf'
+    fake.uploads[upload] = scan
+    res = client.post('/plan', data={'storage_path': upload, 'filename': 'scan.pdf', 'mode': 'standard'})
+    data = _unzip(res)
+    assert [b['source'] for b in data['batches']] == ['outputs/' + 'cd' * 16 + '/ocr-0.pdf',
+                                                      'outputs/' + 'cd' * 16 + '/ocr-1.pdf']
+    lines = {}
+    for b in data['batches']:
+        res = client.post('/ocr', data={'storage_path': upload, 'batch': b['source'],
+                                        'pages': ','.join(map(str, b['pages']))})
+        assert res.status_code == 200, res.data[:200]
+        lines.update(_unzip(res)['lines'])
+        assert b['source'] in fake.deleted  # each batch file is removed once read
+    assert 'Check that the person responds' in json.dumps(lines)
+    # a batch from another upload, or a path outside outputs/<id>/, is refused
+    for bad in ('outputs/' + 'ee' * 16 + '/ocr-0.pdf', 'uploads/' + 'cd' * 16 + '.pdf', '../x/ocr-0.pdf'):
+        res = client.post('/ocr', data={'storage_path': upload, 'batch': bad, 'pages': '0'})
+        assert res.status_code == 400
+
+
+def test_ocr_results_from_the_browser_are_checked(tmp_path):
+    import pymupdf
+    doc = pymupdf.open(scanned_copy(HANDBOOK, tmp_path / 'scan.pdf'))
+    data = {'0': [[10, 50, 12, 'Hello  world'], [-5, 99999, 1e9, 'clamped']],
+            '1': [[10, 50, 12, 'x', 'extra']],             # malformed: page dropped (read again)
+            '9': [[10, 50, 12, 'not a page']], 'x': [], '2': 'nope',
+            '3': [[10, float('nan'), 12, 'nan']]}
+    out = ocr.clean_lines(data, doc, {0, 1, 3})
+    assert list(out) == [0]
+    assert out[0][0] == [10, 50, 12, 'Hello world']
+    x0, base, size, _ = out[0][1]
+    assert x0 == 0 and base == doc[0].rect.height and size == 200

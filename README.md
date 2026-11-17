@@ -91,7 +91,7 @@ pins Python 3.12. The installed dependencies take about 330 MB (plus 4 MB of OCR
 
 Vercel functions accept and return at most 4.5 MB. When B2 is configured, the browser gets a
 one-time upload link from `/upload-url` and uploads the PDF straight to a private B2 bucket (up to
-**100 MB**; the size is signed into the link, so B2 rejects anything else). The function downloads it,
+**200 MB**; the size is signed into the link, so B2 rejects anything else). The function downloads it,
 converts it, deletes it, and returns the deck as a download link that expires after 1 hour.
 Setup: create a private bucket and a bucket-limited Read and Write key in Backblaze and add the four
 `B2_*` variables in Vercel. Then, to set the bucket's CORS rule (browser uploads) and auto-delete rules:
@@ -127,8 +127,8 @@ Either way, the function stops after 300 seconds, so the limits are set for a te
 | `MAX_PAGES` | 800 | Step 1 reads about 0.15–0.3 s a page (a 500-page test book: 91 s in total) |
 | `READ_TIME_LIMIT` | 240 s | Pages are read 40 at a time; past this, step 1 stops with "split it and convert the parts" instead of being cut off by Vercel |
 | `MAX_AI_WORDS` | 30,000 | Condensed and Detailed rewrite only the chosen sections, up to this many words (roughly 75–120 pages). The picker shows the count and says when to untick some. Standard has no such limit |
-| `MAX_OCR_PAGES` | 40 | Scanned pages take 1–3 s each; a scanned textbook needs splitting |
-| `MAX_STORAGE_UPLOAD_MB` | 100 | B2 uploads |
+| `MAX_OCR_PAGES` / `OCR_BATCH` | 40 / 30 | Scanned pages take 1–3 s each: past 40, the browser has them read in batches of 30, four requests at a time |
+| `MAX_STORAGE_UPLOAD_MB` | 200 | B2 uploads |
 
 Step 2 builds only the chosen sections, cut from the plan, so its time depends on the slides made,
 not the book's length (a 1,290-slide deck of the whole 500-page book: 28 s). python-pptx's part
@@ -156,7 +156,17 @@ PyMuPDF, so nothing is installed: it needs only Tesseract's language data, shipp
 into the page as an invisible layer, line by line at its real size, so chapter titles are still
 recognised by their size.
 
-About 1–3 s per scanned page; `MAX_OCR_PAGES` (default 40) keeps a conversion inside Vercel's 300 s.
+Up to `MAX_OCR_PAGES` (40) scanned pages are read inside the normal request. A scanned textbook is
+read in batches instead: `/plan` answers with the scanned pages split into batches of `OCR_BATCH`
+(30), saved as small PDFs beside the upload in B2 so each request downloads only its batch; the
+browser sends them to `POST /ocr` four at a time, shows "Reading scanned pages… 120 of 480", and
+then asks `/plan` again with the text read (checked on the server: only scanned pages, numbers
+clamped, text capped). Measured on a 41-page scanned handbook: 1.7 s a page to OCR, then 0.3 s a
+page to read with that text, so a 300-page scanned book takes about 2–3 minutes of OCR and 1.5
+minutes of reading. The reading step is bound by `READ_TIME_LIMIT`, which puts the practical
+ceiling for a scanned book around 500–700 pages on Vercel. `convert.py` has no time limit and
+reads every scanned page in one run.
+
 Limits: English only unless you add languages (`OCR_LANGUAGES`, e.g. `eng+fra`); symbols such as ₦
 aren't recognised; stylised display type can be misread; scanned brochures lose some product
 layouts because prices and spec tables are harder to tell apart. Settings: `OCR_LANGUAGES`,

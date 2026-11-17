@@ -44,7 +44,11 @@ def main():
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(levelname)s %(name)s: %(message)s')
 
+    import ocr
+    import pdf_to_md
     from pipeline import build_from_plan, outline, plan_from_markdown, read_pdf, safe_filename
+    # No host time limit here: read every page and OCR every scanned page in one run
+    ocr.MAX_OCR_PAGES = pdf_to_md.READ_TIME_LIMIT = float('inf')
     src = Path(args.input)
     work = Path(args.keep) if args.keep else Path(tempfile.mkdtemp(prefix='pdf2pptx-'))
     md_path = src if src.suffix.lower() == '.md' else read_pdf(src, work, args.mode, print)

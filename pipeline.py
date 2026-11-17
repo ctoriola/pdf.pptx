@@ -294,12 +294,12 @@ def build_from_markdown(md_path, mode='standard', theme='coral', title=None, pdf
     return build_from_plan(plan, Path(md_path).parent, mode, theme, None, progress)
 
 
-def read_pdf(pdf_path, work_dir, mode='standard', progress=None):
+def read_pdf(pdf_path, work_dir, mode='standard', progress=None, ocr_lines=None):
     """PDF -> Markdown and images in work_dir/markdown. Returns the Markdown path."""
     from pdf_to_md import convert_pdf
     progress = progress or (lambda msg: None)
     progress('Reading the PDF (layout, text, tables and images)…')
-    return convert_pdf(pdf_path, Path(work_dir) / 'markdown', progress)
+    return convert_pdf(pdf_path, Path(work_dir) / 'markdown', progress, ocr_lines)
 
 
 IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg'}
@@ -332,9 +332,9 @@ def _image_jobs(plan, md_dir, selected):
     return list(jobs.values())
 
 
-def plan_pdf(pdf_path, work_dir, mode='standard', title=None, progress=None, source_name=None):
+def plan_pdf(pdf_path, work_dir, mode='standard', title=None, progress=None, source_name=None, ocr_lines=None):
     """Step 1 of 2: read the PDF and plan its sections. Returns (plan, outline rows, md_path)."""
-    md_path = read_pdf(pdf_path, work_dir, mode, progress)
+    md_path = read_pdf(pdf_path, work_dir, mode, progress, ocr_lines)
     plan = plan_from_markdown(md_path, mode, title, source_name or pdf_path, progress)
     return plan, outline(plan, md_path.parent), md_path
 

@@ -29,9 +29,10 @@ from flask import Flask, abort, jsonify, redirect, render_template, request, sen
 load_dotenv()
 
 import condense  # noqa: E402  (reads LLM settings from the environment loaded above)
+import ocr  # noqa: E402
 import storage  # noqa: E402
 from deck_builder import DEFAULT_THEME, DENSE_AFTER, MAX_TEXT_FILL, TEXT_FILL, THEMES, shrink_pptx  # noqa: E402
-from pdf_to_md import PdfConversionError  # noqa: E402
+from pdf_to_md import NeedsOcr, PdfConversionError  # noqa: E402
 from pipeline import MAX_AI_WORDS  # noqa: E402
 from slide_plan import DEFAULT_MODE, PLANS, normalize_mode  # noqa: E402
 
@@ -224,8 +225,16 @@ def plan_route():
     with tempfile.TemporaryDirectory(prefix='pdf2plan-') as work:
         try:
             mode, _, title = _mode_and_options()
+            ocr_lines = _read_json_part('ocr', 'The scanned pages') if 'ocr' in request.files else None
             pdf_path, filename, ctx = _receive_pdf(work)
-            plan, rows, md_path = plan_pdf(pdf_path, work, mode, title, source_name=filename)
+            try:
+                plan, rows, md_path = plan_pdf(pdf_path, work, mode, title, source_name=filename,
+                                               ocr_lines=ocr_lines)
+            except NeedsOcr as exc:
+                # Too many scanned pages for one request: the browser sends them back in batches
+                # (POST /ocr, several at once), then asks for the plan again with what they read
+                return _gzipped(jsonify(needs_ocr=True, pages=len(exc.pages),
+                                        batches=_ocr_batches(pdf_path, exc.pages, ctx, work)))
             extra = {}
             if ctx:
                 # Step 2 cuts only the chosen pictures and has no full Markdown, so the Markdown
@@ -248,22 +257,100 @@ def plan_route():
 MAX_PLAN_BYTES = 24 * 1024 * 1024  # a long textbook's plan, uncompressed
 
 
-def _read_plan():
-    """The plan the browser sends back: gzip-compressed JSON (or plain JSON) in the 'plan' field."""
-    part = request.files.get('plan')
-    raw = part.read(MAX_PLAN_BYTES + 1) if part else (request.form.get('plan') or '').encode()
+def _read_json_part(field, what):
+    """Gzip-compressed JSON (or plain JSON) the browser sends in a form field or file part."""
+    part = request.files.get(field)
+    raw = part.read(MAX_PLAN_BYTES + 1) if part else (request.form.get(field) or '').encode()
     if raw[:2] == b'\x1f\x8b':
         try:
             with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
                 raw = gz.read(MAX_PLAN_BYTES + 1)
         except OSError:
-            raise InputError('The section list could not be read. Please upload the PDF again.')
+            raise InputError(f'{what} could not be read. Please upload the PDF again.')
     if not raw or len(raw) > MAX_PLAN_BYTES:
-        raise InputError('The section list is missing or too large. Please upload the PDF again.')
+        raise InputError(f'{what} is missing or too large. Please upload the PDF again.')
     try:
         return json.loads(raw)
     except ValueError:
-        raise InputError('The section list could not be read. Please upload the PDF again.')
+        raise InputError(f'{what} could not be read. Please upload the PDF again.')
+
+
+def _read_plan():
+    """The plan the browser sends back with the chosen sections."""
+    return _read_json_part('plan', 'The section list')
+
+
+def _ocr_batches(pdf_path, pages, ctx, work):
+    """
+    Split the scanned pages into batches one request can OCR. With cloud storage, each batch's pages
+    are saved as a small PDF beside the upload, so an /ocr request downloads that batch, not the
+    whole book; for a direct upload, the browser sends the PDF again with each batch's page numbers.
+    """
+    import pymupdf
+    size = ocr.OCR_BATCH
+    batches = [{'pages': pages[i:i + size]} for i in range(0, len(pages), size)]
+    if ctx:
+        with pymupdf.open(str(pdf_path)) as doc:
+            for k, batch in enumerate(batches):
+                part = pymupdf.open()
+                for n in batch['pages']:
+                    part.insert_pdf(doc, from_page=n, to_page=n)
+                local = Path(work) / f'ocr-{k}.pdf'
+                part.save(local, garbage=3, deflate=True)
+                part.close()
+                batch['source'] = f'outputs/{ctx["id"]}/ocr-{k}.pdf'
+                storage.put(local, batch['source'])
+                local.unlink()
+    return batches
+
+
+@app.post('/ocr')
+def ocr_route():
+    """
+    OCR one batch of scanned pages and return what was read, {page: lines}, for the browser to send
+    with its next /plan request. Several of these run at once for a scanned textbook.
+    """
+    import pymupdf
+    opts = _options()
+    with tempfile.TemporaryDirectory(prefix='pdf2ocr-') as work:
+        try:
+            try:
+                pages = [int(x) for x in str(opts.get('pages') or '').split(',') if x.strip()]
+            except ValueError:
+                raise InputError('The page numbers could not be read.')
+            if not pages or len(pages) > max(ocr.OCR_BATCH, ocr.MAX_OCR_PAGES):
+                raise InputError('Send between 1 and %d pages at a time.' % max(ocr.OCR_BATCH, ocr.MAX_OCR_PAGES))
+            if not ocr.available():
+                raise InputError('Reading scanned pages is not available on this server.', 503)
+            batch = None
+            if opts.get('storage_path'):
+                if not storage.enabled():
+                    raise InputError('Cloud uploads are not configured on this server.')
+                try:
+                    upload_id = storage.check_upload_path(opts['storage_path'])
+                    batch = storage.check_ocr_batch_path(opts.get('batch'), upload_id)
+                    pdf_path = Path(work) / 'batch.pdf'
+                    storage.download(batch, pdf_path)
+                except storage.StorageError as exc:
+                    raise InputError(str(exc))
+                with pymupdf.open(str(pdf_path)) as doc:
+                    if doc.page_count != len(pages):
+                        raise InputError('That page batch does not match its page numbers.')
+                    read = ocr.read_pages(doc, list(range(doc.page_count)))
+                lines = {str(pages[k]): v for k, v in read.items()}
+                storage.delete(batch)
+            else:
+                pdf_path, _, _ = _receive_pdf(work)
+                with pymupdf.open(str(pdf_path)) as doc:
+                    if not all(0 <= n < doc.page_count for n in pages):
+                        raise InputError('Those pages are not in this PDF.')
+                    lines = {str(n): v for n, v in ocr.read_pages(doc, pages).items()}
+            return _gzipped(jsonify(lines=lines))
+        except InputError as exc:
+            return jsonify(error=str(exc)), exc.status
+        except Exception:
+            log.exception('OCR batch failed')
+            return jsonify(error='Some scanned pages could not be read.'), 500
 
 
 def _read_selection():

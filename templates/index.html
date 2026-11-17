@@ -249,6 +249,37 @@
     return await new Response(blob.stream().pipeThrough(new CompressionStream('gzip'))).blob();
   }
 
+  // Scanned pages, more than one request can read: OCR batches, OCR_AT_ONCE requests at a time (each its own Vercel function)
+  const OCR_AT_ONCE = 4;
+  async function readScannedPages(data) {
+    const queue = data.batches.slice(), lines = {};
+    let done = 0;
+    const note = () => show('running', `Reading scanned pages (OCR)… ${done} of ${data.pages}`,
+                            'A scanned book takes a few minutes. Keep this tab open.');
+    note();
+    async function worker() {
+      while (queue.length) {
+        const batch = queue.shift();
+        const extra = { pages: batch.pages.join(',') };
+        if (batch.source) extra.batch = batch.source;
+        let res = null;
+        for (let attempt = 0; attempt < 2 && !(res && res.ok); attempt++) {
+          try { res = await fetch('/ocr', { method: 'POST', body: requestBody(extra) }); } catch (e) { res = null; }
+        }
+        if (!res || !res.ok) {
+          const err = new Error('ocr');
+          err.userMessage = res ? await errorText(res) : 'Could not reach the server.';
+          throw err;
+        }
+        Object.assign(lines, (await res.json()).lines);
+        done += batch.pages.length;
+        note();
+      }
+    }
+    await Promise.all(Array.from({ length: OCR_AT_ONCE }, worker));
+    return lines;
+  }
+
   // ---------------- step 1: read the PDF and plan its sections ----------------
   form.addEventListener('submit', async ev => {
     ev.preventDefault();
@@ -265,9 +296,18 @@
       }
       startTicker(['Reading the PDF (layout, text, tables and images)…', 'Working out its chapters and sections…',
                    'Planning the slide structure…'], 4000);
-      const res = await fetch('/plan', { method: 'POST', body: requestBody() });
+      let res = await fetch('/plan', { method: 'POST', body: requestBody() });
       if (!res.ok) return show('error', await errorText(res));
-      const data = await res.json();
+      let data = await res.json();
+      if (data.needs_ocr) {  // a scanned book: its pages are read in batches, then the PDF again
+        clearInterval(ticker); ticker = null;
+        const lines = await readScannedPages(data);
+        startTicker(['Reading the PDF with the text from its scanned pages…', 'Working out its chapters and sections…',
+                     'Planning the slide structure…'], 6000);
+        res = await fetch('/plan', { method: 'POST', body: requestBody({ ocr: await compressed(lines) }) });
+        if (!res.ok) return show('error', await errorText(res));
+        data = await res.json();
+      }
       job.plan = data.plan; job.rows = data.sections; job.markdownUrl = data.markdown_url || null;
       clearInterval(ticker); ticker = null;
       progress.hidden = true;

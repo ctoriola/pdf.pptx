@@ -45,10 +45,22 @@ class PdfConversionError(Exception):
     """The PDF could not be converted (corrupt, encrypted, too long, no text)."""
 
 
-def convert_pdf(pdf_path, out_dir, progress=None):
+class NeedsOcr(PdfConversionError):
+    """
+    More scanned pages than one request can OCR. The web app has the browser send them in batches
+    (POST /ocr) and then reads the PDF again with the results (ocr_lines).
+    """
+    def __init__(self, pages):
+        self.pages = pages
+        super().__init__(f'This PDF has {len(pages)} scanned pages; one request reads up to '
+                         f'{ocr.MAX_OCR_PAGES} with OCR. Split the PDF and convert the parts.')
+
+
+def convert_pdf(pdf_path, out_dir, progress=None, ocr_lines=None):
     """
     Convert a PDF. Returns the path of the written Markdown file; images are saved
     under out_dir/images and referenced as images/<name> relative to the Markdown file.
+    ocr_lines: OCR results already read for some scanned pages (ocr.read_pages, e.g. in batches).
     """
     import pymupdf
     import pymupdf4llm
@@ -75,13 +87,15 @@ def convert_pdf(pdf_path, out_dir, progress=None):
         scanned = ocr.pages_needing_ocr(doc)
         src = doc
         if scanned and ocr.available():
-            if len(scanned) > ocr.MAX_OCR_PAGES:
-                raise PdfConversionError(
-                    f'This PDF has {len(scanned)} scanned pages. Scanned pages are read with OCR, up to '
-                    f'{ocr.MAX_OCR_PAGES} at a time: split the PDF and convert the parts.')
-            progress('This PDF is scanned. Reading its pages with OCR…')
+            lines = ocr.clean_lines(ocr_lines, doc, set(scanned)) if ocr_lines else {}
+            todo = [n for n in scanned if n not in lines]
+            if len(todo) > ocr.MAX_OCR_PAGES:
+                raise NeedsOcr(todo)
             try:
-                src = ocr.make_searchable(doc, scanned, progress)
+                if todo:
+                    progress('This PDF is scanned. Reading its pages with OCR…')
+                    lines.update(ocr.read_pages(doc, todo, progress))
+                src = ocr.apply_lines(doc, lines)
             except Exception as exc:
                 log.exception('OCR failed')
                 raise PdfConversionError('The scanned pages of this PDF could not be read.') from exc
