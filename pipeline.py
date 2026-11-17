@@ -118,7 +118,7 @@ def plan_from_markdown(md_path, mode='standard', title=None, pdf_path='document.
     base = md_path.parent.resolve()
     return {
         'v': PLAN_VERSION, 'title': title, 'kind': kind, 'planner': planned_by,
-        'meta': {k: doc_meta.get(k, '') for k in ('kicker', 'subtitle', 'pages')},
+        'meta': {k: doc_meta.get(k, '') for k in ('kicker', 'subtitle', 'pages', 'ocr_pages')},
         'sections': [{'name': name, 'blocks': [_portable(b, base) for b in blocks]} for name, blocks in sections],
     }
 

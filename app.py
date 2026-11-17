@@ -226,7 +226,7 @@ def plan_route():
             pdf_path, filename, ctx = _receive_pdf(work)
             plan, rows, md_path = plan_pdf(pdf_path, work, mode, title, source_name=filename)
             return jsonify(title=plan['title'], kind=plan['kind'], planner=plan['planner'], mode=mode,
-                           sections=rows, plan=plan)
+                           ocr_pages=plan['meta'].get('ocr_pages') or 0, sections=rows, plan=plan)
         except InputError as exc:
             return jsonify(error=str(exc)), exc.status
         except (PdfConversionError, condense.LLMError) as exc:

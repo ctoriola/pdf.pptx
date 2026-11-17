@@ -311,7 +311,8 @@
     const rows = data.sections;
     const chapters = rows.filter(r => r.chapter);
     pickerSub.textContent = `${data.title} · ${chapters.length ? chapters.length + ' chapters, ' : ''}${rows.length} sections` +
-                            planNote(data.kind, data.planner);
+                            planNote(data.kind, data.planner) +
+                            (data.ocr_pages ? ` · ${data.ocr_pages} scanned ${data.ocr_pages === 1 ? 'page' : 'pages'} read with OCR` : '');
     let i = 0;
     while (i < rows.length) {
       const row = rows[i];

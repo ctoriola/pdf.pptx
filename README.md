@@ -79,7 +79,7 @@ token limits, and HTTP 429 responses are retried using the `Retry-After` header.
 
 The app is stateless: each request converts in a temporary folder and returns the file, so it
 runs as a single Vercel Python function. Vercel detects Flask from `app.py`, and `.python-version`
-pins Python 3.12. The installed dependencies take about 330 MB, under the 500 MB function limit.
+pins Python 3.12. The installed dependencies take about 330 MB (plus 4 MB of OCR language data), under the 500 MB function limit.
 
 1. Import the repo in Vercel. No build settings are needed.
 2. Add `GROQ_API_KEY` under Project → Settings → Environment Variables.
@@ -128,8 +128,22 @@ gunicorn -w 2 --timeout 300 -b 0.0.0.0:8000 app:app
 Settings: `MAX_UPLOAD_MB`, `MAX_RESPONSE_MB` (0 = no limit), `MAX_STORAGE_UPLOAD_MB`, `MAX_PAGES`,
 `MAX_AI_PAGES`.
 
-Scanned PDFs (no text layer) are rejected with a message suggesting OCR first. Tesseract isn't
-available on Vercel.
+### Scanned PDFs (OCR)
+
+Pages that are pictures of text (almost no text layer, mostly covered by an image) are read with
+OCR before anything else, so chapters, layouts and images work as on a normal PDF. Only those pages
+are OCR'd; a mixed PDF keeps its real text elsewhere. `ocr.py` uses the Tesseract engine built into
+PyMuPDF, so nothing is installed: it needs only Tesseract's language data, shipped in `tessdata/`
+(English, "fast" model, Apache 2.0, 4 MB). Each page is read twice, at 200 dpi for body text and at
+50 dpi for display-size headings, which Tesseract misses at high resolution; the text goes back
+into the page as an invisible layer, line by line at its real size, so chapter titles are still
+recognised by their size.
+
+About 1–3 s per scanned page; `MAX_OCR_PAGES` (default 40) keeps a conversion inside Vercel's 300 s.
+Limits: English only unless you add languages (`OCR_LANGUAGES`, e.g. `eng+fra`); symbols such as ₦
+aren't recognised; stylised display type can be misread; scanned brochures lose some product
+layouts because prices and spec tables are harder to tell apart. Settings: `OCR_LANGUAGES`,
+`OCR_DPI`, `MAX_OCR_PAGES`, `OCR_TESSDATA`.
 
 ## Command line
 

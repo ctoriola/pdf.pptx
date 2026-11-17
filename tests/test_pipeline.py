@@ -253,7 +253,7 @@ def test_convert_rejects_text_free_pdf(tmp_path):
     doc = pymupdf.open()
     doc.new_page()
     doc.save(tmp_path / 'blank.pdf')
-    with pytest.raises(pdf_to_md.PdfConversionError, match='scanned'):
+    with pytest.raises(pdf_to_md.PdfConversionError, match='No readable text was found in this PDF'):
         pdf_to_md.convert_pdf(tmp_path / 'blank.pdf', tmp_path / 'out')
 
 
@@ -1440,3 +1440,71 @@ def test_cloud_upload_is_kept_until_the_deck_is_built(cloud):
     res = client.post('/build', data={'storage_path': path, 'filename': 'handbook.pdf', 'mode': 'standard',
                                       'selected': '0,1', 'plan': (io.BytesIO(json.dumps(plan).encode()), 'plan.json')})
     assert res.status_code == 200 and res.json['download_url'] and fake.deleted == [path]
+
+
+# ---------- OCR for scanned PDFs ----------
+import ocr  # noqa: E402
+
+
+def scanned_copy(src, dest, pages=None, dpi=150):
+    """A PDF whose pages are only pictures of the source pages: no text layer, like a scan."""
+    import pymupdf
+    doc, out = pymupdf.open(src), pymupdf.open()
+    for n, page in enumerate(doc):
+        if pages is None or n in pages:
+            pix = page.get_pixmap(dpi=dpi)
+            q = out.new_page(width=page.rect.width, height=page.rect.height)
+            q.insert_image(q.rect, pixmap=pix)
+        else:
+            out.insert_pdf(doc, from_page=n, to_page=n)
+    out.save(dest)
+    return dest
+
+
+def test_ocr_language_data_ships_with_the_app():
+    assert ocr.available() and (ocr.TESSDATA / 'eng.traineddata').stat().st_size > 1_000_000
+
+
+def test_scanned_pdf_is_read_with_ocr(tmp_path):
+    import pymupdf
+    scan = scanned_copy(HANDBOOK, tmp_path / 'scan.pdf')
+    assert sum(len(p.get_text()) for p in pymupdf.open(scan)) == 0
+    assert ocr.pages_needing_ocr(pymupdf.open(scan)) == list(range(7))
+    md = pdf_to_md.convert_pdf(scan, tmp_path / 'out').read_text()
+    assert '"ocr_pages": 7' in md
+    assert 'Check that the person responds' in md and 'Put your hand on the forehead' in md
+    # display-size chapter titles are found even though OCR reads them from a picture
+    assert '## General Concepts of First Aid {.chapter}' in md and '## Care for Adults (18 and Over) {.chapter}' in md
+    assert 'All rights reserved' not in md  # front matter still recognised and dropped
+
+
+def test_only_scanned_pages_are_ocred(tmp_path):
+    import pymupdf
+    mixed = scanned_copy(HANDBOOK, tmp_path / 'mixed.pdf', pages={5})
+    assert ocr.pages_needing_ocr(pymupdf.open(mixed)) == [5]
+    md = pdf_to_md.convert_pdf(mixed, tmp_path / 'out').read_text()
+    assert '"ocr_pages": 1' in md and 'Check that the person responds' in md and 'First aid refers to' in md
+
+
+def test_scanned_deck_end_to_end(tmp_path):
+    from pipeline import convert
+    pptx, _, title, slides = convert(scanned_copy(HANDBOOK, tmp_path / 'scan.pdf'), tmp_path, 'standard')
+    text = ' '.join(sh.text_frame.text for s in Presentation(str(pptx)).slides for sh in s.shapes if sh.has_text_frame)
+    assert slides >= 6 and 'CHAPTER 1' in text and 'Open the airway' in text
+
+
+def test_ocr_limits_and_missing_language_data(tmp_path, monkeypatch):
+    scan = scanned_copy(HANDBOOK, tmp_path / 'scan.pdf')
+    monkeypatch.setattr(ocr, 'MAX_OCR_PAGES', 3)
+    with pytest.raises(pdf_to_md.PdfConversionError, match='7 scanned pages.*up to 3 at a time'):
+        pdf_to_md.convert_pdf(scan, tmp_path / 'a')
+    monkeypatch.setattr(ocr, 'TESSDATA', tmp_path / 'no-tessdata')
+    with pytest.raises(pdf_to_md.PdfConversionError, match='No readable text was found in this PDF'):
+        pdf_to_md.convert_pdf(scan, tmp_path / 'b')
+
+
+def test_ocr_noise_is_dropped():
+    for junk in ('y', 'yy', '= | ~', '@#', '—'):
+        assert ocr._is_noise(junk)
+    for keep in ('1', '02', 'MS-5', 'Send an enquiry', 'Be Safe'):
+        assert not ocr._is_noise(keep)

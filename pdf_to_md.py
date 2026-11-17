@@ -17,6 +17,7 @@ from pathlib import Path
 
 from PIL import Image, ImageStat
 
+import ocr
 import pdf_structure
 from md_parse import IMAGE_RE
 
@@ -68,18 +69,37 @@ def convert_pdf(pdf_path, out_dir, progress=None, uses_llm=False):
                 f'This PDF has {doc.page_count} pages. The AI slide types (Condensed and Detailed) handle up to '
                 f'{MAX_AI_PAGES} pages; choose Standard, which handles up to {MAX_PAGES}.')
         meta_title = (doc.metadata or {}).get('title', '')
+        # Scanned pages (pictures of text) get an invisible text layer first, so everything below
+        # treats them like any other page
+        scanned = ocr.pages_needing_ocr(doc)
+        src = doc
+        if scanned and ocr.available():
+            if len(scanned) > ocr.MAX_OCR_PAGES:
+                raise PdfConversionError(
+                    f'This PDF has {len(scanned)} scanned pages. Scanned pages are read with OCR, up to '
+                    f'{ocr.MAX_OCR_PAGES} at a time: split the PDF and convert the parts.')
+            progress('This PDF is scanned. Reading its pages with OCR…')
+            try:
+                src = ocr.make_searchable(doc, scanned, progress)
+            except Exception as exc:
+                log.exception('OCR failed')
+                raise PdfConversionError('The scanned pages of this PDF could not be read.') from exc
+        elif scanned:
+            log.warning('%d scanned pages, but no OCR language data in %s', len(scanned), ocr.TESSDATA)
         try:
-            info = pdf_structure.analyze(doc)
+            info = pdf_structure.analyze(src)
             chunks = pymupdf4llm.to_markdown(
-                doc, write_images=True, image_path=str(img_dir), image_format='png', dpi=RENDER_DPI,
+                src, write_images=True, image_path=str(img_dir), image_format='png', dpi=RENDER_DPI,
                 header=False, footer=False, use_ocr=False, show_progress=False, page_chunks=True)
         except Exception as exc:
             log.exception('pymupdf4llm failed')
             raise PdfConversionError(f'Could not read this PDF: {exc}') from exc
         try:
-            pdf_structure.recover_missed_images(doc, chunks, str(img_dir), RENDER_DPI)
+            pdf_structure.recover_missed_images(src, chunks, str(img_dir), RENDER_DPI)
         except Exception:  # a safety net only: never fail a conversion over it
             log.exception('Recovering missed images failed')
+        if src is not doc:
+            src.close()
 
     text = pdf_structure.assemble([c.get('text', '') for c in chunks], info)
     text = relative_image_refs(text, img_dir)
@@ -87,13 +107,15 @@ def convert_pdf(pdf_path, out_dir, progress=None, uses_llm=False):
     text = optimize_images(text, out_dir)
     text = normalize_headings(clean_markdown(text), choose_title(meta_title, info.get('cover_title', '')),
                               info.get('acronyms', ()))
-    meta = {'pages': len(chunks), 'chapters': len(info.get('chapters', {})),
+    meta = {'pages': len(chunks), 'chapters': len(info.get('chapters', {})), 'ocr_pages': len(scanned),
             'subtitle': info.get('cover_subtitle', ''), 'kicker': info.get('cover_kicker', '')}
     text = f'<!-- pdf2pptx {json.dumps(meta, ensure_ascii=False)} -->\n\n' + text
     words = len(re.sub(r'!\[[^\]]*\]\([^)]*\)', '', text).split())
     if words < 20:
-        raise PdfConversionError('No readable text was found. This looks like a scanned PDF; '
-                                 'run it through OCR first, then upload it again.')
+        if scanned and ocr.available():
+            raise PdfConversionError('No readable text was found, even after reading the scanned pages with OCR. '
+                                     'The scan may be too faint or blurred.')
+        raise PdfConversionError('No readable text was found in this PDF.')
     md_path.write_text(text, encoding='utf-8')
     return md_path
 

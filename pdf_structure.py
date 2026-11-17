@@ -8,12 +8,14 @@ PDF itself (font sizes and page contents):
   - pages that should not become slides: table of contents, copyright/legal, bare covers
   - text inside figures ("picture text"), which duplicates what the image already shows
 """
+import math
 import re
 from collections import Counter, defaultdict
 
 CHAPTER_MARK = '{.chapter}'
 DISPLAY_RATIO = 1.8        # a line this many times the body size is a display heading
 MAX_CHAPTER_PAGE_SHARE = 0.5
+SIZE_STEP = 1.08            # font sizes within ~8% count as one size
 
 PICTURE_TEXT_RE = re.compile(
     r'<!--\s*Start of picture text\s*-->.*?<!--\s*End of picture text\s*-->'
@@ -111,15 +113,21 @@ def analyze(doc):
     # The chapter size: the display size found on the most pages (at least two, at most half),
     # used for exactly one heading on each of them. A size that heads several blocks on one page
     # is a section heading, and one-off cover lettering never recurs.
-    pages_by_size = defaultdict(set)
+    # Sizes are grouped in ~8% steps: text read by OCR comes back a few percent off its real size
+    pages_by_size, sizes_in = defaultdict(set), defaultdict(list)
     for n, lines in enumerate(per_page):
         for text, size, _ in lines:
             if display(text, size):
-                pages_by_size[round(size)].add(n)
+                key = round(math.log(size) / math.log(SIZE_STEP))
+                pages_by_size[key].add(n)
+                sizes_in[key].append(size)
     chapters = {}
-    candidates = [(len(pages), size) for size, pages in pages_by_size.items()
-                  if 2 <= len(pages) <= max(2, len(per_page) * MAX_CHAPTER_PAGE_SHARE)
-                  and all(len(runs_at(per_page[n], size)) == 1 for n in pages)]
+    candidates = []
+    for key, pages in pages_by_size.items():
+        size = sorted(sizes_in[key])[len(sizes_in[key]) // 2]
+        if 2 <= len(pages) <= max(2, len(per_page) * MAX_CHAPTER_PAGE_SHARE) \
+                and all(len(runs_at(per_page[n], size)) == 1 for n in pages):
+            candidates.append((len(pages), size))
     if candidates:
         _, chapter_size = max(candidates)
         for n, lines in enumerate(per_page):
@@ -241,8 +249,8 @@ def cover_extras(text, title):
             continue  # letter-spaced logo lettering: "E I G E R  S E C U R I T Y"
         if len(words) >= 6 and len(raw) <= 220 and len(raw) > len(subtitle):
             subtitle = raw
-        elif not kicker and 2 <= len(words) <= 6 and len(raw) <= 48:
-            kicker = raw
+        elif not kicker and 2 <= len(words) <= 6 and len(raw) <= 48 and sum(c.isalpha() for c in raw) >= 6:
+            kicker = raw  # (a scanned logo can read as two or three stray letters: not a label)
     return subtitle, kicker
 
 
