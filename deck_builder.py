@@ -1310,6 +1310,25 @@ _theme_lock = threading.Lock()
 AGENDA_RANGE = (3, 14)
 
 
+def estimate_slides(sections, one_slide_per_section=False):
+    """
+    Slides each section would make on its own (split at its sub-headings, as in a real build;
+    packing with neighbours and chapter dividers not counted). Used by the section picker.
+    """
+    global T
+    with _theme_lock:
+        T = THEMES[DEFAULT_THEME]
+        builder = DeckBuilder('estimate', one_slide_per_section=one_slide_per_section)
+        counts = []
+        for name, blocks in sections:
+            before = builder.page
+            parts = [(name, blocks)] if one_slide_per_section else split_long_sections([(name, blocks)])
+            for part_name, part in parts:
+                builder.section(1, part_name, part)
+            counts.append(builder.page - before)
+        return counts
+
+
 def build_deck(title, sections, theme=DEFAULT_THEME, subtitle='Presentation', one_slide_per_section=False,
                agenda=True, tagline='', kind='document'):
     """

@@ -96,7 +96,7 @@
             </label>
           </div>
 
-          <button type="submit" id="submit" class="submit">Convert to slides <span class="go" aria-hidden="true">→</span></button>
+          <button type="submit" id="submit" class="submit">Read the PDF <span class="go" aria-hidden="true">→</span></button>
         </div>
       </div>
     </form>
@@ -111,7 +111,30 @@
           <button type="button" id="dl-md" class="button secondary">Download Markdown + images</button>
         </div>
       </div>
-      <button type="button" id="again" class="link" hidden style="align-self:flex-start">Convert another PDF</button>
+      <div class="actions" style="margin-top:4px">
+        <button type="button" id="reselect" class="link" hidden>Change the sections</button>
+        <button type="button" id="again" class="link" hidden>Convert another PDF</button>
+      </div>
+    </section>
+
+    <section id="picker" class="card span-12" hidden aria-labelledby="picker-title">
+      <div class="picker-head">
+        <div>
+          <span class="pill">Step 2 of 2</span>
+          <h2 class="title" id="picker-title" style="margin-top:14px">Choose what goes in</h2>
+          <p class="small muted" id="picker-sub" style="margin-top:8px"></p>
+        </div>
+        <div class="picker-tools">
+          <button type="button" class="chip-btn" id="sel-all">Select all</button>
+          <button type="button" class="chip-btn" id="sel-none">Clear</button>
+        </div>
+      </div>
+      <div id="sections" class="sections"></div>
+      <div class="picker-foot">
+        <button type="button" class="link dark" id="back">← Choose another PDF</button>
+        <span id="total" class="total"></span>
+        <button type="button" id="build" class="submit build">Build slides <span class="go" aria-hidden="true">→</span></button>
+      </div>
     </section>
 
     <!-- how it works -->
@@ -138,20 +161,15 @@
 <script>
 (() => {
   const MAX_MB = {{ max_upload_mb }};
-  const form = document.getElementById('form');
-  const input = document.getElementById('pdf');
-  const drop = document.getElementById('drop');
-  const dropTitle = document.getElementById('drop-title');
-  const progress = document.getElementById('progress');
-  const message = document.getElementById('message');
-  const sub = document.getElementById('sub');
-  const spinner = document.getElementById('spinner');
-  const result = document.getElementById('result');
-  const again = document.getElementById('again');
-  const dlPptx = document.getElementById('dl-pptx');
-  const dlMd = document.getElementById('dl-md');
-  let lastForm = null;
-  let ticker = null;
+  const DENSITY = {{ density | tojson }};  // long decks get fuller slides; see deck_builder.DENSE_AFTER
+  const $ = id => document.getElementById(id);
+  const form = $('form'), input = $('pdf'), drop = $('drop'), dropTitle = $('drop-title');
+  const progress = $('progress'), message = $('message'), sub = $('sub'), spinner = $('spinner');
+  const result = $('result'), again = $('again'), dlPptx = $('dl-pptx'), dlMd = $('dl-md');
+  const picker = $('picker'), list = $('sections'), total = $('total'), pickerSub = $('picker-sub');
+  const buildBtn = $('build');
+  let lastForm = null, ticker = null, markdownUrl = null;
+  let job = null;   // {file, storagePath, plan, rows, mode} between the two steps
 
   input.addEventListener('change', () => {
     dropTitle.textContent = input.files[0] ? input.files[0].name : 'Choose a PDF or drop it here';
@@ -173,15 +191,11 @@
     if (state !== 'running' && ticker) { clearInterval(ticker); ticker = null; }
   }
 
-  // The server does everything in one request; show where it probably is
-  function startTicker(usesLlm) {
-    const steps = ['Reading the PDF (layout, text, tables and images)…', 'Planning the slide structure…']
-      .concat(usesLlm ? ['Asking the AI to rewrite each section…', 'Still writing. Long documents take a minute or two…'] : [])
-      .concat(['Building slides…']);
+  // Each step is one request; show where the server probably is
+  function startTicker(steps, every) {
     let i = 0;
     show('running', steps[0], 'Keep this tab open.');
-    ticker = setInterval(() => { if (i < steps.length - 1) show('running', steps[++i], 'Keep this tab open.'); },
-                         usesLlm ? 9000 : 4000);
+    ticker = setInterval(() => { if (i < steps.length - 1) show('running', steps[++i], 'Keep this tab open.'); }, every);
   }
 
   function saveBlob(blob, name) {
@@ -201,12 +215,10 @@
   async function errorText(res) {
     try { return (await res.json()).error; } catch (e) {
       return res.status === 413 ? `That PDF is larger than ${MAX_MB} MB.` :
-             res.status === 504 ? 'The conversion took too long. Try a shorter PDF or the Standard slide type.' :
+             res.status === 504 ? 'This took too long. Try a shorter PDF, fewer sections or the Standard slide type.' :
              'The conversion failed.';
     }
   }
-
-  let markdownUrl = null;
 
   // "· brochure layout, planned with AI": what the document was read as, and who arranged it
   function planNote(kind, planner) {
@@ -220,59 +232,197 @@
     document.body.appendChild(a); a.click(); a.remove();
   }
 
-  // Cloud route: upload to Backblaze B2, then send only the file's path
-  async function convertViaCloud(file, mode, usesLlm) {
-    show('running', 'Uploading… 0%', 'Keep this tab open.');
-    const { path } = await window.cloudUpload(file, pct => show('running', `Uploading… ${pct}%`, 'Keep this tab open.'));
-    startTicker(usesLlm);
-    const body = Object.fromEntries(lastForm.entries());
-    delete body.pdf;
-    Object.assign(body, { storage_path: path, filename: file.name });
-    const res = await fetch('/convert', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) return show('error', await errorText(res));
-    const data = await res.json();
-    triggerDownload(data.download_url);
-    dlPptx.href = data.download_url; dlPptx.removeAttribute('download');
-    markdownUrl = data.markdown_url || null;
-    show('done', 'Your slides are ready and downloading.',
-         `${data.title} · ${data.slides} slides${planNote(data.kind, data.planner)} · links work for 1 hour`);
-    result.hidden = false;
+  // The fields both steps send, plus the PDF itself or its place in cloud storage
+  function requestBody(extra = {}) {
+    const body = new FormData();
+    for (const key of ['mode', 'theme', 'title']) body.append(key, lastForm.get(key) || '');
+    if (job.storagePath) { body.append('storage_path', job.storagePath); body.append('filename', job.file.name); }
+    else body.append('pdf', job.file, job.file.name);
+    for (const [k, v] of Object.entries(extra)) v instanceof Blob ? body.append(k, v, k + '.json.gz') : body.append(k, v);
+    return body;
   }
 
-  // Direct route: the PDF goes in the request and the deck comes back in the response
-  async function convertDirect(usesLlm) {
-    startTicker(usesLlm);
-    const res = await fetch('/convert', { method: 'POST', body: lastForm });
-    if (!res.ok) return show('error', await errorText(res));
-    const name = filenameFrom(res, 'slides.pptx');
-    const url = saveBlob(await res.blob(), name);
-    dlPptx.href = url; dlPptx.download = name;
-    markdownUrl = null;
-    show('done', 'Your slides are ready and downloading.',
-         `${res.headers.get('X-Title') || name} · ${res.headers.get('X-Slides') || '?'} slides` +
-         planNote(res.headers.get('X-Kind'), res.headers.get('X-Planner')));
-    result.hidden = false;
+  async function compressed(obj) {
+    const blob = new Blob([JSON.stringify(obj)], { type: 'application/json' });
+    if (!window.CompressionStream) return blob;  // the server accepts plain JSON too
+    return await new Response(blob.stream().pipeThrough(new CompressionStream('gzip'))).blob();
   }
 
+  // ---------------- step 1: read the PDF and plan its sections ----------------
   form.addEventListener('submit', async ev => {
     ev.preventDefault();
     const file = input.files[0];
-    if (file && file.size > MAX_MB * 1024 * 1024) return show('error', `That PDF is larger than ${MAX_MB} MB.`);
+    if (!file) return;
+    if (file.size > MAX_MB * 1024 * 1024) return show('error', `That PDF is larger than ${MAX_MB} MB.`);
     lastForm = new FormData(form);
-    const mode = form.querySelector('input[name=mode]:checked');
-    const usesLlm = !!(mode && mode.closest('.mode').querySelector('.tag'));
-    form.hidden = true;
-    result.hidden = true;
+    job = { file, storagePath: null, mode: lastForm.get('mode') };
+    form.hidden = true; result.hidden = true; picker.hidden = true;
     try {
-      if (window.cloudUpload) await convertViaCloud(file, mode, usesLlm);
-      else await convertDirect(usesLlm);
+      if (window.cloudUpload) {
+        show('running', 'Uploading… 0%', 'Keep this tab open.');
+        job.storagePath = (await window.cloudUpload(file, pct => show('running', `Uploading… ${pct}%`, 'Keep this tab open.'))).path;
+      }
+      startTicker(['Reading the PDF (layout, text, tables and images)…', 'Working out its chapters and sections…',
+                   'Planning the slide structure…'], 4000);
+      const res = await fetch('/plan', { method: 'POST', body: requestBody() });
+      if (!res.ok) return show('error', await errorText(res));
+      const data = await res.json();
+      job.plan = data.plan; job.rows = data.sections;
+      clearInterval(ticker); ticker = null;
+      progress.hidden = true;
+      renderPicker(data);
     } catch (err) {
       console.error(err);
       show('error', err && err.userMessage ? err.userMessage : 'Could not reach the server.');
+    }
+  });
+
+  // ---------------- the section picker ----------------
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;  // always text: section names come from the PDF
+    return e;
+  }
+
+  function checkbox(ids) {
+    const box = el('input');
+    box.type = 'checkbox'; box.checked = true; box.dataset.ids = ids.join(',');
+    return box;
+  }
+
+  function sectionRow(row, label) {
+    const item = el('label', 'sec');
+    const box = checkbox([row.id]);
+    box.dataset.id = row.id;
+    item.append(box, el('span', 'tick'));
+    const main = el('span', 'sec-main');
+    main.append(el('span', 'sec-title', label || row.name));
+    if (row.preview) main.append(el('span', 'sec-preview', row.preview));
+    const meta = el('span', 'sec-meta');
+    if (row.layout) meta.append(el('span', 'chip', row.layout));
+    meta.append(el('span', 'chip', row.slides === 1 ? '1 slide' : `${row.slides} slides`));
+    item.append(main, meta);
+    return item;
+  }
+
+  function renderPicker(data) {
+    list.replaceChildren();
+    const rows = data.sections;
+    const chapters = rows.filter(r => r.chapter);
+    pickerSub.textContent = `${data.title} · ${chapters.length ? chapters.length + ' chapters, ' : ''}${rows.length} sections` +
+                            planNote(data.kind, data.planner);
+    let i = 0;
+    while (i < rows.length) {
+      const row = rows[i];
+      if (!row.chapter) { list.append(sectionRow(row)); i++; continue; }
+      const members = rows.filter(r => r.group === row.id);
+      const details = el('details', 'chap');
+      details.open = chapters.length <= 4;
+      const summary = el('summary', 'chap-head');
+      const head = el('label', 'sec chap-label');
+      const box = checkbox(members.map(r => r.id));
+      box.classList.add('chap-box');
+      head.append(box, el('span', 'tick'));
+      const main = el('span', 'sec-main');
+      main.append(el('span', 'chap-kicker', `Chapter ${chapters.indexOf(row) + 1}`), el('span', 'sec-title', row.name));
+      const meta = el('span', 'sec-meta');
+      meta.append(el('span', 'chip chap-count', ''));
+      head.append(main, meta);
+      head.addEventListener('click', ev => ev.stopPropagation());  // ticking does not fold the chapter
+      summary.append(head, el('span', 'caret', ''));
+      details.append(summary);
+      const inner = el('div', 'chap-body');
+      members.forEach(r => inner.append(sectionRow(r, r.id === row.id ? 'Chapter opening' : r.name)));
+      details.append(inner);
+      list.append(details);
+      i += members.length;
+    }
+    picker.hidden = false;
+    update();
+    picker.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  function sectionBoxes() { return [...list.querySelectorAll('input[data-id]')]; }
+  function selectedIds() { return sectionBoxes().filter(b => b.checked).map(b => Number(b.dataset.id)); }
+
+  function update() {
+    const chosen = new Set(selectedIds());
+    // chapter boxes: ticked, unticked or mixed, from their sections
+    list.querySelectorAll('.chap-box').forEach(box => {
+      const ids = box.dataset.ids.split(',').map(Number);
+      const n = ids.filter(id => chosen.has(id)).length;
+      box.checked = n === ids.length; box.indeterminate = n > 0 && n < ids.length;
+      const count = box.closest('.chap').querySelector('.chap-count');
+      count.textContent = n === ids.length ? `${ids.length} sections` : `${n} of ${ids.length}`;
+      box.closest('.chap').classList.toggle('off', n === 0);
+    });
+    sectionBoxes().forEach(b => b.closest('.sec').classList.toggle('off', !b.checked));
+    // the slide estimate, by slide type
+    const rows = job.rows.filter(r => chosen.has(r.id));
+    const groups = new Set(rows.filter(r => r.group !== null).map(r => r.group));
+    let slides = 2;  // cover and closing
+    if (job.mode === 'condensed') slides += Math.min(rows.length, 12) + (rows.length >= 3 ? 1 : 0);
+    else {
+      const body = rows.reduce((n, r) => n + r.slides, 0);
+      let content = job.mode === 'detailed' ? body * 1.4 : body;
+      const extra = groups.size + (groups.size >= 2 || rows.length >= 3 ? 1 : 0);
+      if (content + extra + 2 > DENSITY.after) {  // past this, slides hold more text, so there are fewer
+        const fill = Math.min(DENSITY.max, DENSITY.fill * (content + extra + 2) / DENSITY.after);
+        content *= Math.pow(DENSITY.fill / fill, 0.6);
+      }
+      slides += Math.round(content) + extra;
+    }
+    total.textContent = rows.length ? `About ${slides} slides · ${rows.length} of ${job.rows.length} sections`
+                                    : 'Choose at least one section';
+    buildBtn.disabled = !rows.length;
+  }
+
+  list.addEventListener('change', ev => {
+    const box = ev.target;
+    if (box.classList.contains('chap-box')) {
+      const ids = new Set(box.dataset.ids.split(',').map(Number));
+      sectionBoxes().forEach(b => { if (ids.has(Number(b.dataset.id))) b.checked = box.checked; });
+    }
+    update();
+  });
+  $('sel-all').addEventListener('click', () => { sectionBoxes().forEach(b => { b.checked = true; }); update(); });
+  $('sel-none').addEventListener('click', () => { sectionBoxes().forEach(b => { b.checked = false; }); update(); });
+  $('back').addEventListener('click', () => { picker.hidden = true; form.hidden = false; job = null; });
+
+  // ---------------- step 2: build the deck from the chosen sections ----------------
+  buildBtn.addEventListener('click', async () => {
+    const selected = selectedIds();
+    if (!selected.length) return;
+    const usesLlm = job.mode !== 'standard';
+    picker.hidden = true; result.hidden = true;
+    startTicker(['Building slides…'].concat(usesLlm ? ['Asking the AI to rewrite each section…',
+                 'Still writing. Long documents take a minute or two…', 'Building slides…'] : []), usesLlm ? 9000 : 4000);
+    try {
+      const body = requestBody({ selected: selected.join(','), plan: await compressed(job.plan) });
+      const res = await fetch('/build', { method: 'POST', body });
+      if (!res.ok) { show('error', await errorText(res)); return; }
+      if (job.storagePath) {
+        const data = await res.json();
+        triggerDownload(data.download_url);
+        dlPptx.href = data.download_url; dlPptx.removeAttribute('download');
+        markdownUrl = data.markdown_url || null;
+        show('done', 'Your slides are ready and downloading.',
+             `${data.title} · ${data.slides} slides${planNote(data.kind, data.planner)} · links work for 1 hour`);
+      } else {
+        const name = filenameFrom(res, 'slides.pptx');
+        const url = saveBlob(await res.blob(), name);
+        dlPptx.href = url; dlPptx.download = name;
+        markdownUrl = null;
+        show('done', 'Your slides are ready and downloading.',
+             `${res.headers.get('X-Title') || name} · ${res.headers.get('X-Slides') || '?'} slides` +
+             planNote(res.headers.get('X-Kind'), res.headers.get('X-Planner')));
+      }
+      result.hidden = false;
+      $('reselect').hidden = !!job.storagePath;  // a cloud upload is removed once the deck is built
+    } catch (err) {
+      console.error(err);
+      show('error', 'Could not reach the server.');
     }
   });
 
@@ -289,9 +439,9 @@
     }
   });
 
+  $('reselect').addEventListener('click', () => { progress.hidden = true; picker.hidden = false; update(); });
   again.addEventListener('click', () => {
-    progress.hidden = true;
-    form.hidden = false;
+    progress.hidden = true; picker.hidden = true; form.hidden = false; job = null;
   });
 })();
 </script>

@@ -187,6 +187,56 @@ button:disabled { opacity: .6; cursor: progress; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
 
+/* ---- section picker ---- */
+.picker-head { display: flex; justify-content: space-between; align-items: flex-end; gap: 18px; flex-wrap: wrap; margin-bottom: 20px; }
+.picker-tools { display: flex; gap: 8px; }
+.chip-btn { background: var(--tile); color: var(--ink); padding: 9px 16px; font-size: 13px; }
+.chip-btn:hover { background: #e2e2e2; }
+.sections { display: grid; gap: 8px; }
+.sec {
+  display: grid; grid-template-columns: 26px 1fr auto; align-items: center; gap: 14px;
+  background: var(--tile); border-radius: var(--r-sm); padding: 14px 16px; cursor: pointer;
+  transition: background .15s, opacity .15s;
+}
+.sec:hover { background: #e7e7e7; }
+.sec input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.tick {
+  width: 24px; height: 24px; border-radius: 8px; background: #fff; box-shadow: inset 0 0 0 1.5px #c9c9c9;
+  display: grid; place-items: center; transition: background .15s, box-shadow .15s;
+}
+.sec input:checked + .tick { background: var(--mint); box-shadow: none; }
+.sec input:checked + .tick::after { content: "✓"; color: var(--mint-ink); font-size: 14px; font-weight: 700; }
+.sec input:indeterminate + .tick { background: var(--mint); box-shadow: none; }
+.sec input:indeterminate + .tick::after { content: "–"; color: var(--mint-ink); font-size: 16px; font-weight: 700; }
+.sec input:focus-visible + .tick { outline: 2px solid var(--ink); outline-offset: 2px; }
+.sec-main { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.sec-title { color: var(--ink); font-size: 15px; font-weight: 500; letter-spacing: -0.01em; }
+.sec-preview { font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sec-meta { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.chip { font-size: 11px; font-weight: 600; color: var(--body); background: #fff; border-radius: 999px; padding: 4px 10px; white-space: nowrap; }
+.sec.off { opacity: .5; }
+.sec.off .tick { background: #fff; }
+.chap { border-radius: var(--r-md); background: var(--tile); }
+.chap.off { opacity: .55; }
+.chap-head { list-style: none; display: flex; align-items: center; gap: 4px; padding-right: 14px; cursor: pointer; }
+.chap-head::-webkit-details-marker { display: none; }
+.chap-label { flex: 1; background: transparent; }
+.chap-label:hover { background: transparent; }
+.chap-kicker { font-size: 10.5px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.chap-label .sec-title { font-size: 17px; }
+.caret { width: 30px; height: 30px; border-radius: 50%; background: #fff; display: grid; place-items: center; flex: none; }
+.caret::after { content: "▾"; font-size: 13px; color: var(--ink); transition: transform .15s; }
+.chap[open] .caret::after { transform: rotate(180deg); }
+.chap-body { display: grid; gap: 6px; padding: 0 10px 10px 40px; }
+.chap-body .sec { background: #fff; }
+.chap-body .sec:hover { background: #fafafa; }
+.chap-body .chip { background: var(--tile); }
+.picker-foot { display: flex; align-items: center; gap: 16px; margin-top: 20px; flex-wrap: wrap; }
+.picker-foot .total { margin-left: auto; color: var(--ink); font-weight: 500; font-size: 14px; }
+.build { width: auto; margin: 0; min-width: 220px; }
+.link.dark { color: var(--muted); }
+.link.dark:hover { color: var(--ink); }
+
 /* ---- small cards ---- */
 .step { display: flex; flex-direction: column; justify-content: space-between; min-height: 150px; gap: 18px; padding: 22px; }
 .step h3 { font-size: 20px; letter-spacing: -0.025em; line-height: 1.1; }
@@ -220,6 +270,11 @@ code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .hero { min-height: 0; gap: 22px; }
 }
 @media (max-width: 560px) {
+  .sec { grid-template-columns: 26px 1fr; }
+  .sec-meta { grid-column: 2; justify-content: flex-start; }
+  .chap-body { padding-left: 10px; }
+  .picker-foot .total { margin-left: 0; width: 100%; order: -1; }
+  .build { width: 100%; }
   .wrap { padding: 12px 12px 40px; }
   .card { padding: 20px; border-radius: 22px; }
   .modes { grid-template-columns: 1fr; gap: 16px; }

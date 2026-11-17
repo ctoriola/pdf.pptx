@@ -1339,3 +1339,104 @@ def test_nothing_public_mentions_the_setup_page(client, cloud):
     for c in (client, cloud[0]):
         html = c.get('/').data.decode()
         assert '/setup' not in html and 'Storage setup' not in html
+
+
+# ---------- choosing sections: plan first, build after ----------
+from pipeline import build_from_plan, outline, plan_from_markdown, sections_from_plan  # noqa: E402
+
+
+@pytest.fixture
+def handbook_plan(tmp_path):
+    md = pdf_to_md.convert_pdf(HANDBOOK, tmp_path / 'markdown')
+    plan = plan_from_markdown(md, 'standard', pdf_path='handbook.pdf')
+    return plan, md.parent
+
+
+def test_plan_is_portable_json(handbook_plan):
+    plan, md_dir = handbook_plan
+    restored = json.loads(json.dumps(plan))  # what the browser holds and sends back
+    assert restored['v'] == 1 and restored['title'] == 'FAH First Aid Handbook'
+    images = [b for s in restored['sections'] for b in s['blocks'] if b['type'] == 'image']
+    assert images and all(not Path(b['path']).is_absolute() for b in images)  # no server paths leave the server
+    rows = outline(restored, md_dir)
+    chapters = [r for r in rows if r['chapter']]
+    assert [r['name'] for r in chapters] == ['General Concepts of First Aid', 'Care for Adults (18 and Over)']
+    assert all(r['slides'] >= 1 for r in rows) and all(r['group'] is not None for r in rows)
+    steps = next(r for r in rows if r['name'] == 'Step by Step')
+    assert steps['group'] == chapters[1]['id'] and 'Check that the person' in steps['preview']
+
+
+def test_only_chosen_sections_are_built(handbook_plan):
+    plan, md_dir = handbook_plan
+    rows = outline(plan, md_dir)
+    pick = next(r for r in rows if r['name'] == 'Step by Step')
+    buffer, _, slides = build_from_plan(plan, md_dir, 'standard', 'mint', [pick['id']])
+    text = ' '.join(sh.text_frame.text for s in Presentation(buffer).slides for sh in s.shapes if sh.has_text_frame)
+    assert 'Check that the person' in text and 'Open the airway' in text
+    assert 'First aid refers to' not in text and 'What is the first thing to check' not in text
+    # its chapter's opening section was not chosen, but the chapter still gets its divider
+    assert 'CHAPTER 1' in text and 'Care for Adults (18 and Over)' in text and 'General Concepts' not in text
+
+
+def test_choosing_nothing_or_bad_plans_are_refused(handbook_plan, tmp_path):
+    plan, md_dir = handbook_plan
+    with pytest.raises(ValueError, match='at least one'):
+        build_from_plan(plan, md_dir, 'standard', 'coral', [9999])
+    for bad in ({}, {'v': 2, 'sections': []}, {'v': 1, 'sections': 'nope'}, [1, 2]):
+        with pytest.raises(ValueError):
+            sections_from_plan(bad, md_dir)
+
+
+def test_a_tampered_plan_cannot_reach_other_files(handbook_plan, tmp_path):
+    plan, md_dir = handbook_plan
+    secret = tmp_path / 'secret.png'
+    shutil.copy(FIXTURES / 'images' / 'photo2.png', secret)
+    evil = json.loads(json.dumps(plan))
+    evil['sections'][0]['blocks'] += [{'type': 'image', 'path': '../secret.png', 'caption': ''},
+                                      {'type': 'image', 'path': str(secret), 'caption': ''},
+                                      {'type': 'image', 'path': '/etc/passwd', 'caption': ''},
+                                      {'type': 'script', 'text': 'x'}, 'not a block']
+    sections = sections_from_plan(evil, md_dir)
+    paths = [b['path'] for _, bl in sections for b in bl if b['type'] == 'image']
+    assert paths and all(Path(p).resolve().is_relative_to(Path(md_dir).resolve()) for p in paths)
+    assert not any(b['type'] == 'script' for _, bl in sections for b in bl)
+
+
+def test_plan_then_build_routes(client):
+    import io
+    import gzip
+    with open(HANDBOOK, 'rb') as f:
+        res = client.post('/plan', data={'pdf': (f, 'handbook.pdf'), 'mode': 'standard'})
+    assert res.status_code == 200, res.data[:300]
+    data = res.json
+    assert data['title'] == 'FAH First Aid Handbook' and data['sections'] and data['plan']['v'] == 1
+    quiz = next(r for r in data['sections'] if r['name'] == 'Self-Assessment')
+    packed = gzip.compress(json.dumps(data['plan']).encode())  # as the browser sends it
+    with open(HANDBOOK, 'rb') as f:
+        res = client.post('/build', data={'pdf': (f, 'handbook.pdf'), 'mode': 'standard', 'theme': 'mint',
+                                          'selected': str(quiz['id']), 'plan': (io.BytesIO(packed), 'plan.json.gz')})
+    assert res.status_code == 200, res.data[:300]
+    text = ' '.join(sh.text_frame.text for s in Presentation(io.BytesIO(res.data)).slides
+                    for sh in s.shapes if sh.has_text_frame)
+    assert 'What is the first thing to check' in text and 'Open the airway' not in text
+    with open(HANDBOOK, 'rb') as f:  # nothing chosen
+        res = client.post('/build', data={'pdf': (f, 'handbook.pdf'), 'selected': '',
+                                          'plan': (io.BytesIO(packed), 'plan.json.gz')})
+    assert res.status_code == 400 and 'at least one' in res.json['error']
+    with open(HANDBOOK, 'rb') as f:  # a damaged section list
+        res = client.post('/build', data={'pdf': (f, 'handbook.pdf'), 'selected': '1',
+                                          'plan': (io.BytesIO(b'\x1f\x8bnot gzip'), 'plan.json.gz')})
+    assert res.status_code == 400 and 'upload the PDF again' in res.json['error']
+
+
+def test_cloud_upload_is_kept_until_the_deck_is_built(cloud):
+    import io
+    client, fake = cloud
+    path = 'uploads/' + 'ef' * 16 + '.pdf'
+    fake.uploads[path] = HANDBOOK
+    res = client.post('/plan', data={'storage_path': path, 'filename': 'handbook.pdf', 'mode': 'standard'})
+    assert res.status_code == 200 and fake.deleted == []  # still needed for step 2
+    plan = res.json['plan']
+    res = client.post('/build', data={'storage_path': path, 'filename': 'handbook.pdf', 'mode': 'standard',
+                                      'selected': '0,1', 'plan': (io.BytesIO(json.dumps(plan).encode()), 'plan.json')})
+    assert res.status_code == 200 and res.json['download_url'] and fake.deleted == [path]

@@ -11,6 +11,7 @@ Two upload routes:
   - Direct: the PDF is posted in the request and the file is returned in the response.
     On Vercel this is capped at 4.5 MB each way.
 """
+import gzip
 import hashlib
 import hmac
 import io
@@ -29,7 +30,7 @@ load_dotenv()
 
 import condense  # noqa: E402  (reads LLM settings from the environment loaded above)
 import storage  # noqa: E402
-from deck_builder import DEFAULT_THEME, THEMES, shrink_pptx  # noqa: E402
+from deck_builder import DEFAULT_THEME, DENSE_AFTER, MAX_TEXT_FILL, TEXT_FILL, THEMES, shrink_pptx  # noqa: E402
 from pdf_to_md import PdfConversionError  # noqa: E402
 from slide_plan import DEFAULT_MODE, PLANS, normalize_mode  # noqa: E402
 
@@ -38,13 +39,15 @@ log = logging.getLogger('app')
 
 ON_VERCEL = bool(os.environ.get('VERCEL'))
 # Vercel functions accept at most 4.5 MB per request and per response
-MAX_UPLOAD_MB = float(os.environ.get('MAX_UPLOAD_MB', 4.4 if ON_VERCEL else 50))
+MAX_UPLOAD_MB = float(os.environ.get('MAX_UPLOAD_MB', 4.0 if ON_VERCEL else 50))
+# the second step also carries the section list (compressed), so the request may be a little larger
+PLAN_ALLOWANCE_MB = 0.45
 MAX_RESPONSE_MB = float(os.environ.get('MAX_RESPONSE_MB', 4.4 if ON_VERCEL else 0))  # 0 = no limit
 
 PPTX_MIME = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
 
 app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = int(MAX_UPLOAD_MB * 1024 * 1024)
+app.config['MAX_CONTENT_LENGTH'] = int((MAX_UPLOAD_MB + PLAN_ALLOWANCE_MB) * 1024 * 1024)
 
 
 class InputError(Exception):
@@ -56,7 +59,8 @@ class InputError(Exception):
 @app.get('/')
 def index():
     use_storage = storage.enabled()
-    return render_template('index.html', plans=PLANS, default_mode=DEFAULT_MODE, themes=THEMES,
+    density = {'after': DENSE_AFTER, 'fill': TEXT_FILL, 'max': MAX_TEXT_FILL}
+    return render_template('index.html', plans=PLANS, default_mode=DEFAULT_MODE, themes=THEMES, density=density,
                            default_theme=DEFAULT_THEME, llm_ready=condense.llm_available(),
                            max_upload_mb=f'{storage.MAX_STORAGE_UPLOAD_MB if use_storage else MAX_UPLOAD_MB:g}',
                            cloud_upload=use_storage)
@@ -166,6 +170,8 @@ def _receive_pdf(work):
         if not upload or not upload.filename:
             raise InputError('Choose a PDF to upload.')
         upload.save(pdf_path)
+        if pdf_path.stat().st_size > MAX_UPLOAD_MB * 1024 * 1024:
+            raise InputError(f'That PDF is larger than {MAX_UPLOAD_MB:g} MB.', 413)
         ctx, filename = None, upload.filename
     with open(pdf_path, 'rb') as f:
         if f.read(5) != b'%PDF-':
@@ -191,6 +197,108 @@ def _deliver(local_path, download_name, mimetype, ctx, extra=None):
         resp.headers[f'X-{key.title()}'] = str(value).encode('ascii', 'ignore').decode()
     resp.headers['Access-Control-Expose-Headers'] = 'X-Title, X-Slides, X-Kind, X-Planner, Content-Disposition'
     return resp
+
+
+def _mode_and_options():
+    """(mode, theme, title) from the request, or an InputError if the slide type is not available."""
+    opts = _options()
+    mode = normalize_mode(opts.get('mode'))
+    if PLANS[mode]['uses_llm'] and not condense.llm_available():
+        raise InputError(f'{PLANS[mode]["label"]} slides use AI, which is not switched on for this site. '
+                         'Choose Standard.')
+    theme = opts.get('theme') if opts.get('theme') in THEMES else DEFAULT_THEME
+    title = (opts.get('title') or '').strip()[:120] or None
+    return mode, theme, title
+
+
+@app.post('/plan')
+def plan_route():
+    """
+    Step 1 of 2: read the PDF and plan its sections, without building slides. Returns the section
+    list for the picker and the plan itself, which the browser sends back with its choices to
+    /build. A PDF in cloud storage is kept for that second step (the bucket's lifecycle rule
+    removes it if the second step never comes).
+    """
+    from pipeline import plan_pdf
+    with tempfile.TemporaryDirectory(prefix='pdf2plan-') as work:
+        try:
+            mode, _, title = _mode_and_options()
+            pdf_path, filename, ctx = _receive_pdf(work)
+            plan, rows, md_path = plan_pdf(pdf_path, work, mode, title, source_name=filename)
+            return jsonify(title=plan['title'], kind=plan['kind'], planner=plan['planner'], mode=mode,
+                           sections=rows, plan=plan)
+        except InputError as exc:
+            return jsonify(error=str(exc)), exc.status
+        except (PdfConversionError, condense.LLMError) as exc:
+            return jsonify(error=str(exc)), 422
+        except Exception:
+            log.exception('Planning failed')
+            return jsonify(error='Something went wrong while reading this PDF.'), 500
+
+
+MAX_PLAN_BYTES = 8 * 1024 * 1024
+
+
+def _read_plan():
+    """The plan the browser sends back: gzip-compressed JSON (or plain JSON) in the 'plan' field."""
+    part = request.files.get('plan')
+    raw = part.read(MAX_PLAN_BYTES + 1) if part else (request.form.get('plan') or '').encode()
+    if raw[:2] == b'\x1f\x8b':
+        try:
+            with gzip.GzipFile(fileobj=io.BytesIO(raw)) as gz:
+                raw = gz.read(MAX_PLAN_BYTES + 1)
+        except OSError:
+            raise InputError('The section list could not be read. Please upload the PDF again.')
+    if not raw or len(raw) > MAX_PLAN_BYTES:
+        raise InputError('The section list is missing or too large. Please upload the PDF again.')
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise InputError('The section list could not be read. Please upload the PDF again.')
+
+
+def _read_selection():
+    raw = (_options().get('selected') or '').strip()
+    try:
+        ids = sorted({int(x) for x in raw.split(',') if x.strip()})
+    except ValueError:
+        raise InputError('The choice of sections could not be read.')
+    if not ids:
+        raise InputError('Choose at least one section.')
+    return ids
+
+
+@app.post('/build')
+def build_route():
+    """Step 2 of 2: build the deck from the plan, with only the chosen sections."""
+    from pipeline import build_pdf
+    ctx = None
+    with tempfile.TemporaryDirectory(prefix='pdf2pptx-') as work:
+        try:
+            mode, theme, _ = _mode_and_options()
+            plan, selected = _read_plan(), _read_selection()
+            pdf_path, filename, ctx = _receive_pdf(work)
+            try:
+                pptx_path, md_path, deck_title, slide_total = build_pdf(pdf_path, work, plan, mode, theme, selected)
+            except ValueError as exc:  # an unusable plan or an empty selection
+                raise InputError(str(exc))
+            extra = {'title': deck_title, 'slides': slide_total, 'kind': plan.get('kind', ''),
+                     'planner': plan.get('planner', '')}
+            if ctx:
+                zip_path = _zip_markdown(md_path, Path(work) / (pptx_path.stem + '_markdown.zip'))
+                extra['markdown_url'] = storage.upload_result(
+                    zip_path, f'outputs/{ctx["id"]}/{zip_path.name}', zip_path.name, 'application/zip')
+            return _deliver(pptx_path, pptx_path.name, PPTX_MIME, ctx, extra)
+        except InputError as exc:
+            return jsonify(error=str(exc)), exc.status
+        except (PdfConversionError, condense.LLMError) as exc:
+            return jsonify(error=str(exc)), 422
+        except Exception:
+            log.exception('Build failed')
+            return jsonify(error='Something went wrong while building the slides.'), 500
+        finally:
+            if ctx:
+                storage.delete(ctx['path'])  # the PDF is no longer needed
 
 
 @app.post('/convert')

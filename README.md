@@ -26,6 +26,23 @@ PDF ──PyMuPDF──▶ Markdown + images ──parse──▶ sections ─�
 
 Each slide carries at most half the text it could physically hold (`TEXT_FILL = 0.5` in `deck_builder.py`), set as large as the box allows up to 24pt. Past 90 slides the budget grows automatically (to at most 85%) so a long handbook stays a usable length. Chapters get divider slides and drive the agenda and slide badges. Long sections split at their own sub-headings; short ones share a slide, keeping numbered lists together. Page breaks are balanced, never strand a list's last item or separate a question from its options, and wide diagrams get the slide's full width.
 
+## Choosing sections
+
+Converting is two steps. **Step 1** (`POST /plan`) reads the PDF and plans its chapters and
+sections without making slides, and the page lists them: chapters with their sections, each
+with a preview, its layout and a slide estimate, all ticked to start. **Step 2** (`POST /build`)
+makes the deck from only the ticked sections; the agenda and chapter numbers follow the choice,
+and a chapter whose opening section is left out still gets its divider slide. In the AI slide
+types, only the chosen sections are sent to the LLM.
+
+Vercel keeps nothing between requests, so step 1 hands the plan to the browser, which sends it
+back (gzip-compressed) with the choice. The server checks it, resolves images only inside that
+conversion's own folder, and reads the PDF again just for its images; no AI planning repeats. A
+PDF in B2 storage stays there between the steps and is deleted once the deck is built.
+`POST /convert` still does both steps at once with every section.
+
+On the command line: `python convert.py report.pdf --list`, then `--sections 0,3-7,12`.
+
 ## Slide types
 
 | Type | Text source | Slides |
