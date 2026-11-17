@@ -120,21 +120,38 @@ Without the four `B2_*` variables the app falls back to direct uploads:
 
 ### Textbooks
 
-Either way, the function stops after 300 seconds, so the limits are set for a textbook to fit:
+Either way, a Vercel function stops after 300 seconds. A textbook (up to `MAX_PAGES`, 3,000 pages)
+is therefore read by several requests at once:
+
+```
+browser ──/plan──▶ "needs parts": the book cut into 300-page parts (saved beside the upload in B2)
+        ──/read ×4 at a time──▶ each part: its pages' Markdown + each picture's fingerprint, size, position
+        ──/plan + parts──▶ plan from the whole book's text ──▶ section picker
+        ──/build──▶ only the chosen sections; their pictures cut from the PDF
+```
+
+- **Same result as one read.** pymupdf4llm ranks heading sizes over the pages it is given, so each
+  heading is tagged with its font size and `relevel_headings` ranks them once over the whole book.
+  Tests check that a book read in parts plans exactly like one read in one go.
+- **No pictures in the plan step.** The parts send what filtering (duplicates, repeated logos,
+  blanks) and layout need: fingerprint, size, kind and position. The plan is made from those, and
+  `/build` cuts the chosen pictures from the PDF.
+- **Scanned books** are OCR'd first (below), and each part gets the text of its own scanned pages.
+- Each part request downloads only its part from B2, not the whole book.
 
 | Setting | Default | Why |
 |---|---|---|
-| `MAX_PAGES` | 800 | Step 1 reads about 0.15–0.3 s a page (a 500-page test book: 91 s in total) |
-| `READ_TIME_LIMIT` | 240 s | Pages are read 40 at a time; past this, step 1 stops with "split it and convert the parts" instead of being cut off by Vercel |
+| `MAX_PAGES` | 3000 | Long books are read in parts |
+| `READ_PAGES` | 300 | Pages one request reads (about 0.15–0.3 s a page) |
+| `READ_TIME_LIMIT` | 240 s | Past this, a request stops with a clear message instead of being cut off by Vercel |
 | `MAX_AI_WORDS` | 30,000 | Condensed and Detailed rewrite only the chosen sections, up to this many words (roughly 75–120 pages). The picker shows the count and says when to untick some. Standard has no such limit |
 | `MAX_OCR_PAGES` / `OCR_BATCH` | 40 / 30 | Scanned pages take 1–3 s each: past 40, the browser has them read in batches of 30, four requests at a time |
 | `MAX_STORAGE_UPLOAD_MB` | 200 | B2 uploads |
 
-Step 2 builds only the chosen sections, cut from the plan, so its time depends on the slides made,
-not the book's length (a 1,290-slide deck of the whole 500-page book: 28 s). python-pptx's part
-naming, which made each slide slower than the last, is replaced with a linear one in `deck_builder.py`.
-The plan sent to the browser is gzip-compressed (about a quarter of its size), keeping a long
-book's plan under Vercel's 4.5 MB response limit.
+Step 2 builds only the chosen sections, so its time depends on the slides made, not the book's
+length. python-pptx's part naming, which made each slide slower than the last, is replaced with a
+linear one in `deck_builder.py`. Plans and parts travel gzip-compressed, keeping them under
+Vercel's 4.5 MB request and response limits.
 
 On other hosts (Render, Railway, Fly.io) direct uploads default to 50 MB:
 

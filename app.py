@@ -32,7 +32,7 @@ import condense  # noqa: E402  (reads LLM settings from the environment loaded a
 import ocr  # noqa: E402
 import storage  # noqa: E402
 from deck_builder import DEFAULT_THEME, DENSE_AFTER, MAX_TEXT_FILL, TEXT_FILL, THEMES, shrink_pptx  # noqa: E402
-from pdf_to_md import NeedsOcr, PdfConversionError  # noqa: E402
+from pdf_to_md import NeedsOcr, NeedsParts, PdfConversionError  # noqa: E402
 from pipeline import MAX_AI_WORDS  # noqa: E402
 from slide_plan import DEFAULT_MODE, PLANS, normalize_mode  # noqa: E402
 
@@ -226,15 +226,21 @@ def plan_route():
         try:
             mode, _, title = _mode_and_options()
             ocr_lines = _read_json_part('ocr', 'The scanned pages') if 'ocr' in request.files else None
+            parts = _read_json_part('parts', 'The pages read') if 'parts' in request.files else None
             pdf_path, filename, ctx = _receive_pdf(work)
             try:
                 plan, rows, md_path = plan_pdf(pdf_path, work, mode, title, source_name=filename,
-                                               ocr_lines=ocr_lines)
+                                               ocr_lines=ocr_lines, parts=parts)
             except NeedsOcr as exc:
                 # Too many scanned pages for one request: the browser sends them back in batches
                 # (POST /ocr, several at once), then asks for the plan again with what they read
                 return _gzipped(jsonify(needs_ocr=True, pages=len(exc.pages),
                                         batches=_ocr_batches(pdf_path, exc.pages, ctx, work)))
+            except NeedsParts as exc:
+                # A book longer than one request can read: the browser has it read in parts
+                # (POST /read, several at once), then asks for the plan with the parts
+                return _gzipped(jsonify(needs_parts=True, pages=sum(n for _, n in exc.ranges),
+                                        parts=_read_parts(pdf_path, exc.ranges, ctx, work)))
             extra = {}
             if ctx:
                 # Step 2 cuts only the chosen pictures and has no full Markdown, so the Markdown
@@ -304,6 +310,65 @@ def _ocr_batches(pdf_path, pages, ctx, work):
     return batches
 
 
+def _read_parts(pdf_path, ranges, ctx, work):
+    """The parts a long book is read in. With cloud storage each part's pages are saved as their own
+    PDF beside the upload, so a /read request downloads its part, not the whole book."""
+    import pymupdf
+    parts = [{'first': first, 'count': count} for first, count in ranges]
+    if ctx:
+        with pymupdf.open(str(pdf_path)) as doc:
+            for k, part in enumerate(parts):
+                piece = pymupdf.open()
+                piece.insert_pdf(doc, from_page=part['first'], to_page=part['first'] + part['count'] - 1)
+                local = Path(work) / f'part-{k}.pdf'
+                piece.save(local, garbage=3, deflate=True)
+                piece.close()
+                part['source'] = f'outputs/{ctx["id"]}/part-{k}.pdf'
+                storage.put(local, part['source'])
+                local.unlink()
+    return parts
+
+
+@app.post('/read')
+def read_route():
+    """Read one part of a long book (its page text, and its pictures' sizes and positions)."""
+    from pdf_to_md import READ_PAGES, read_part
+    opts = _options()
+    with tempfile.TemporaryDirectory(prefix='pdf2read-') as work:
+        try:
+            try:
+                first, count = int(opts.get('first')), int(opts.get('count'))
+            except (TypeError, ValueError):
+                raise InputError('The page numbers could not be read.')
+            if first < 0 or not 0 < count <= READ_PAGES:
+                raise InputError(f'Send between 1 and {READ_PAGES} pages at a time.')
+            ocr_lines = _read_json_part('ocr', 'The scanned pages') if 'ocr' in request.files else None
+            source = None
+            if opts.get('storage_path'):
+                if not storage.enabled():
+                    raise InputError('Cloud uploads are not configured on this server.')
+                try:
+                    upload_id = storage.check_upload_path(opts['storage_path'])
+                    source = storage.check_work_file(opts.get('part'), upload_id, 'part')
+                    pdf_path = Path(work) / 'part.pdf'
+                    storage.download(source, pdf_path)
+                except storage.StorageError as exc:
+                    raise InputError(str(exc))
+            else:
+                pdf_path, _, _ = _receive_pdf(work)
+            result = read_part(pdf_path, first, count, Path(work) / 'read', ocr_lines, is_part_file=bool(source))
+            if source:
+                storage.delete(source)
+            return _gzipped(jsonify(result))
+        except InputError as exc:
+            return jsonify(error=str(exc)), exc.status
+        except PdfConversionError as exc:
+            return jsonify(error=str(exc)), 422
+        except Exception:
+            log.exception('Reading a part failed')
+            return jsonify(error='Part of this PDF could not be read.'), 500
+
+
 @app.post('/ocr')
 def ocr_route():
     """
@@ -328,7 +393,7 @@ def ocr_route():
                     raise InputError('Cloud uploads are not configured on this server.')
                 try:
                     upload_id = storage.check_upload_path(opts['storage_path'])
-                    batch = storage.check_ocr_batch_path(opts.get('batch'), upload_id)
+                    batch = storage.check_work_file(opts.get('batch'), upload_id, 'ocr')
                     pdf_path = Path(work) / 'batch.pdf'
                     storage.download(batch, pdf_path)
                 except storage.StorageError as exc:

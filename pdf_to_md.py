@@ -32,17 +32,81 @@ LOGO_MAX_PX = 400           # at 150 dpi, under ~2.7in: small enough to be a hea
 BANNER_ASPECT = 2.5         # this much wider than tall (or taller than wide) reads as a banner
 DUPLICATE_DISTANCE = 6      # perceptual-hash bits that may differ between copies of one picture
 MAX_IMAGE_PX = 1600         # longest side after recompression
-# Reading takes about 0.15-0.3 s a page, and the build step no longer re-reads the PDF (it cuts the
-# chosen pictures straight from their pages), so a ~800-page textbook fits Vercel's 300 s
-MAX_PAGES = int(os.environ.get('MAX_PAGES', 800))
+# Reading takes about 0.15-0.3 s a page. One request reads up to READ_PAGES; a longer book is read in
+# parts by several requests at once (read_part), then planned from the parts' text in one more
+MAX_PAGES = int(os.environ.get('MAX_PAGES', 3000))
+READ_PAGES = int(os.environ.get('READ_PAGES', 300))
 # Pages are read in batches; past this many seconds of reading, the conversion stops with a clear
 # message instead of being cut off by the host (Vercel ends a function at 300 s)
 READ_TIME_LIMIT = float(os.environ.get('READ_TIME_LIMIT', 240))
 READ_BATCH = 40
 
 
+# ---- heading levels across the whole book ----
+# pymupdf4llm ranks heading font sizes over the pages of each call (the largest becomes "#"), so a
+# book read in batches or in parts would get levels that depend on where it was cut. Each heading
+# is tagged with its font size instead, and relevel_headings ranks the sizes once over the whole
+# book, exactly as pymupdf4llm would over a single call.
+FS_MARK = re.compile(r'^(#{1,6}) <!--fs ([0-9.]+)-->', re.M)
+
+
+def _tag_heading_sizes():
+    from pymupdf4llm.helpers import document_layout as dl
+    if getattr(dl, '_pdf2pptx_tagged', False):
+        return
+    original_update = dl.update_header_tags
+
+    class Level(int):
+        fs = None
+
+    def update_header_tags(pages, header_fontsizes):
+        original_update(pages, header_fontsizes)
+        for page in pages:
+            for box in page.boxes:
+                if box.boxclass in ('title', 'section-header') and box.header_level:
+                    level = Level(box.header_level)
+                    level.fs = box.max_fontsize
+                    box.header_level = level
+
+    def tagged(convert):
+        def to_md(header_level, textlines):
+            md = convert(header_level, textlines)
+            fs = getattr(header_level, 'fs', None)
+            hashes = '#' * int(header_level)
+            if fs is None or not md.startswith(hashes + ' '):
+                return md
+            return f'{hashes} <!--fs {float(fs):g}-->' + md[len(hashes) + 1:]
+        return to_md
+
+    dl.update_header_tags = update_header_tags
+    dl.section_hdr_to_md = tagged(dl.section_hdr_to_md)
+    dl.title_to_md = tagged(dl.title_to_md)
+    dl._pdf2pptx_tagged = True
+
+
+def relevel_headings(page_texts):
+    """Heading levels from font sizes ranked over every page, and the size tags removed."""
+    sizes = sorted({float(m.group(2)) for t in page_texts for m in FS_MARK.finditer(t)}, reverse=True)[:6]
+
+    def level(m):
+        fs = float(m.group(2))
+        return '#' * (sizes.index(fs) + 1 if fs in sizes else 6) + ' '
+    return [FS_MARK.sub(level, t) for t in page_texts]
+
+
 class PdfConversionError(Exception):
     """The PDF could not be converted (corrupt, encrypted, too long, no text)."""
+
+
+class NeedsParts(PdfConversionError):
+    """
+    Longer than one request can read: the web app has the browser read it in parts (POST /read,
+    several at once) and then plans it from them (parts=...).
+    """
+    def __init__(self, page_count):
+        self.ranges = [(first, min(READ_PAGES, page_count - first)) for first in range(0, page_count, READ_PAGES)]
+        super().__init__(f'This PDF has {page_count} pages; one request reads up to {READ_PAGES}. '
+                         'Split the PDF and convert the parts.')
 
 
 class NeedsOcr(PdfConversionError):
@@ -56,15 +120,86 @@ class NeedsOcr(PdfConversionError):
                          f'{ocr.MAX_OCR_PAGES} with OCR. Split the PDF and convert the parts.')
 
 
-def convert_pdf(pdf_path, out_dir, progress=None, ocr_lines=None):
+def _open(pdf_path):
+    import pymupdf
+    try:
+        doc = pymupdf.open(str(pdf_path))
+    except Exception as exc:
+        raise PdfConversionError('This file could not be opened as a PDF.') from exc
+    if doc.needs_pass:
+        doc.close()
+        raise PdfConversionError('This PDF is password-protected. Remove the password and try again.')
+    return doc
+
+
+def _with_ocr(doc, ocr_lines, progress, may_ocr_here=True):
+    """
+    (src, scanned pages): src is doc, or a copy whose scanned pages carry the OCR text layer.
+    Pages already read (ocr_lines) are used as they are; NeedsOcr when the rest are too many for
+    this request (or when none may be read here: a long book is read in parts, which need the text).
+    """
+    scanned = ocr.pages_needing_ocr(doc)
+    if not scanned:
+        return doc, scanned
+    if not ocr.available():
+        log.warning('%d scanned pages, but no OCR language data in %s', len(scanned), ocr.TESSDATA)
+        return doc, scanned
+    lines = ocr.clean_lines(ocr_lines, doc, set(scanned)) if ocr_lines else {}
+    todo = [n for n in scanned if n not in lines]
+    if len(todo) > ocr.MAX_OCR_PAGES or (todo and not may_ocr_here):
+        raise NeedsOcr(todo)
+    try:
+        if todo:
+            progress('This PDF is scanned. Reading its pages with OCR…')
+            lines.update(ocr.read_pages(doc, todo, progress))
+        return ocr.apply_lines(doc, lines), scanned
+    except Exception as exc:
+        log.exception('OCR failed')
+        raise PdfConversionError('The scanned pages of this PDF could not be read.') from exc
+
+
+def _read_pages(src, pages, img_dir, progress, started):
+    """
+    pymupdf4llm over `pages`, READ_BATCH at a time and within READ_TIME_LIMIT. Returns (page chunks,
+    {picture file: (page index, bbox)}).
+    """
+    import pymupdf4llm
+    _tag_heading_sizes()
+    chunks = []
+    try:
+        for i in range(0, len(pages), READ_BATCH):
+            if chunks and time.monotonic() - started > READ_TIME_LIMIT:
+                raise PdfConversionError(
+                    f'This PDF is too long to read in one go here: {i} of its {len(pages)} pages were read '
+                    f'in the time allowed. Split it (for example by part or chapter) and convert the parts.')
+            batch = pages[i:i + READ_BATCH]
+            if len(pages) > READ_BATCH:
+                progress(f'Reading pages {i + 1}-{i + len(batch)} of {len(pages)}…')
+            chunks += pymupdf4llm.to_markdown(
+                src, pages=batch, write_images=True, image_path=str(img_dir), image_format='png', dpi=RENDER_DPI,
+                header=False, footer=False, use_ocr=False, show_progress=False, page_chunks=True)
+    except PdfConversionError:
+        raise
+    except Exception as exc:
+        log.exception('pymupdf4llm failed')
+        raise PdfConversionError(f'Could not read this PDF: {exc}') from exc
+    try:
+        saved = pdf_structure.recover_missed_images(src, chunks, str(img_dir), RENDER_DPI)
+    except Exception:  # a safety net only: never fail a conversion over it
+        log.exception('Recovering missed images failed')
+        saved = {}
+    return chunks, pdf_structure.image_boxes(chunks, img_dir, saved)
+
+
+def convert_pdf(pdf_path, out_dir, progress=None, ocr_lines=None, parts=None):
     """
     Convert a PDF. Returns the path of the written Markdown file; images are saved
     under out_dir/images and referenced as images/<name> relative to the Markdown file.
     ocr_lines: OCR results already read for some scanned pages (ocr.read_pages, e.g. in batches).
+    parts: a book longer than READ_PAGES, read in parts by read_part (in parallel requests). Its
+    pictures are then known by size and position only (nothing is saved under images/): the plan
+    needs no more, and the build step cuts the chosen ones from the PDF.
     """
-    import pymupdf
-    import pymupdf4llm
-
     out_dir = Path(out_dir)
     img_dir = out_dir / 'images'
     img_dir.mkdir(parents=True, exist_ok=True)
@@ -72,72 +207,46 @@ def convert_pdf(pdf_path, out_dir, progress=None, ocr_lines=None):
     progress = progress or (lambda msg: None)
     started = time.monotonic()
 
-    try:
-        doc = pymupdf.open(str(pdf_path))
-    except Exception as exc:
-        raise PdfConversionError('This file could not be opened as a PDF.') from exc
-    with doc:
-        if doc.needs_pass:
-            raise PdfConversionError('This PDF is password-protected. Remove the password and try again.')
+    with _open(pdf_path) as doc:
         if doc.page_count > MAX_PAGES:
             raise PdfConversionError(f'This PDF has {doc.page_count} pages; the limit is {MAX_PAGES}.')
         meta_title = (doc.metadata or {}).get('title', '')
+        long_book = doc.page_count > READ_PAGES
         # Scanned pages (pictures of text) get an invisible text layer first, so everything below
         # treats them like any other page
-        scanned = ocr.pages_needing_ocr(doc)
-        src = doc
-        if scanned and ocr.available():
-            lines = ocr.clean_lines(ocr_lines, doc, set(scanned)) if ocr_lines else {}
-            todo = [n for n in scanned if n not in lines]
-            if len(todo) > ocr.MAX_OCR_PAGES:
-                raise NeedsOcr(todo)
-            try:
-                if todo:
-                    progress('This PDF is scanned. Reading its pages with OCR…')
-                    lines.update(ocr.read_pages(doc, todo, progress))
-                src = ocr.apply_lines(doc, lines)
-            except Exception as exc:
-                log.exception('OCR failed')
-                raise PdfConversionError('The scanned pages of this PDF could not be read.') from exc
-        elif scanned:
-            log.warning('%d scanned pages, but no OCR language data in %s', len(scanned), ocr.TESSDATA)
+        src, scanned = _with_ocr(doc, ocr_lines, progress, may_ocr_here=not long_book)
+        if long_book and parts is None:
+            raise NeedsParts(doc.page_count)
         try:
             info = pdf_structure.analyze(src)
-            chunks = []
-            for first in range(0, src.page_count, READ_BATCH):
-                if chunks and time.monotonic() - started > READ_TIME_LIMIT:
-                    raise PdfConversionError(
-                        f'This PDF is too long to read in one go here: {first} of its {src.page_count} pages '
-                        f'were read in the time allowed. Split it (for example by part or chapter) and convert '
-                        f'the parts.')
-                if src.page_count > READ_BATCH:
-                    progress(f'Reading pages {first + 1}-{min(first + READ_BATCH, src.page_count)} '
-                             f'of {src.page_count}…')
-                chunks += pymupdf4llm.to_markdown(
-                    src, pages=list(range(first, min(first + READ_BATCH, src.page_count))),
-                    write_images=True, image_path=str(img_dir), image_format='png', dpi=RENDER_DPI,
-                    header=False, footer=False, use_ocr=False, show_progress=False, page_chunks=True)
-        except PdfConversionError:
-            raise
         except Exception as exc:
-            log.exception('pymupdf4llm failed')
+            log.exception('Reading the layout failed')
             raise PdfConversionError(f'Could not read this PDF: {exc}') from exc
-        try:
-            saved = pdf_structure.recover_missed_images(src, chunks, str(img_dir), RENDER_DPI)
-        except Exception:  # a safety net only: never fail a conversion over it
-            log.exception('Recovering missed images failed')
-            saved = {}
-        boxes = pdf_structure.image_boxes(chunks, img_dir, saved)
+        if parts is None:
+            chunks, boxes = _read_pages(src, list(range(src.page_count)), img_dir, progress, started)
+            page_texts, facts = [c.get('text', '') for c in chunks], None
+        else:
+            progress('Putting the parts together…')
+            page_texts, facts = join_parts(parts, doc.page_count)
+        page_texts = relevel_headings(page_texts)
         if src is not doc:
             src.close()
+        page_count = doc.page_count
 
-    text = pdf_structure.assemble([c.get('text', '') for c in chunks], info)
-    text = relative_image_refs(text, img_dir)
-    text = filter_images(text, out_dir)
-    text = optimize_images(text, out_dir)
+    text = pdf_structure.assemble(page_texts, info)
+    if facts is None:
+        text = relative_image_refs(text, img_dir)
+        text = filter_images(text, out_dir)
+        text = optimize_images(text, out_dir)
+        positions = {Path(name).stem: [page, *[round(v, 2) for v in bbox]] for name, (page, bbox) in boxes.items()}
+        sizes = {}
+    else:
+        text = filter_images(text, out_dir, facts)
+        positions = {Path(name).stem: f['box'] for name, f in facts.items()}
+        sizes = {name: f['size'] for name, f in facts.items()}
     text = normalize_headings(clean_markdown(text), choose_title(meta_title, info.get('cover_title', '')),
                               info.get('acronyms', ()))
-    meta = {'pages': len(chunks), 'chapters': len(info.get('chapters', {})), 'ocr_pages': len(scanned),
+    meta = {'pages': page_count, 'chapters': len(info.get('chapters', {})), 'ocr_pages': len(scanned),
             'subtitle': info.get('cover_subtitle', ''), 'kicker': info.get('cover_kicker', '')}
     text = f'<!-- pdf2pptx {json.dumps(meta, ensure_ascii=False)} -->\n\n' + text
     words = len(re.sub(r'!\[[^\]]*\]\([^)]*\)', '', text).split())
@@ -148,11 +257,131 @@ def convert_pdf(pdf_path, out_dir, progress=None, ocr_lines=None):
         raise PdfConversionError('No readable text was found in this PDF.')
     md_path.write_text(text, encoding='utf-8')
     # where each picture still in use came from, so the build step can cut it again (render_images)
-    used = {Path(m.group('path')).stem for m in map(IMAGE_RE.match, map(str.strip, text.split('\n'))) if m}
-    (out_dir / BOXES_FILE).write_text(json.dumps(
-        {Path(name).stem: [page, *[round(v, 2) for v in bbox]] for name, (page, bbox) in boxes.items()
-         if Path(name).stem in used}))
+    used = {Path(m.group('path')).name for m in map(IMAGE_RE.match, map(str.strip, text.split('\n'))) if m}
+    stems = {Path(n).stem for n in used}
+    (out_dir / BOXES_FILE).write_text(json.dumps({k: v for k, v in positions.items() if k in stems}))
+    if sizes:
+        (out_dir / SIZES_FILE).write_text(json.dumps({k: v for k, v in sizes.items() if k in used}))
     return md_path
+
+
+# ============================================================
+# Long books: read in parts, in parallel requests
+# ============================================================
+def read_part(pdf_path, first, count, out_dir, ocr_lines=None, is_part_file=False, progress=None):
+    """
+    Read pages first..first+count-1 of a book: from the whole PDF, or from a PDF holding just those
+    pages (is_part_file, cut by the web app so a request downloads only its part). Returns plain
+    JSON for convert_pdf(parts=...): the Markdown of each page, and for each picture what filtering
+    and planning need (fingerprint, size, kind) and where it is, so the picture itself is not kept.
+    ocr_lines: OCR text for this part's scanned pages, by page number in the whole book.
+    """
+    out_dir = Path(out_dir)
+    img_dir = out_dir / 'images'
+    img_dir.mkdir(parents=True, exist_ok=True)
+    progress = progress or (lambda msg: None)
+    started = time.monotonic()
+    with _open(pdf_path) as doc:
+        if is_part_file:
+            if doc.page_count != count:
+                raise PdfConversionError('That part of the PDF does not match its page numbers.')
+            pages, offset = list(range(count)), first
+        else:
+            if not (0 <= first < doc.page_count and 0 < count <= doc.page_count - first):
+                raise PdfConversionError('Those pages are not in this PDF.')
+            pages, offset = list(range(first, first + count)), 0
+        src = doc
+        if ocr_lines:
+            local = {}
+            for key, value in ocr_lines.items():
+                try:
+                    local[int(key) - offset] = value
+                except (TypeError, ValueError):
+                    continue
+            scanned = set(ocr.pages_needing_ocr(doc)) & set(pages)
+            lines = ocr.clean_lines(local, doc, scanned)
+            if lines:
+                src = ocr.apply_lines(doc, lines)
+        chunks, boxes = _read_pages(src, pages, img_dir, progress, started)
+        if src is not doc:
+            src.close()
+
+    rename, images = {}, {}
+    for name, (page, bbox) in boxes.items():
+        facts = image_facts(img_dir / name)
+        if facts is None:
+            continue
+        k = int(name[-6:-4]) if name[-6:-4].isdigit() else 0
+        kind = 'missed' if name.startswith('missed-') else 'pic'
+        new = f'{kind}-{page + offset + 1:04d}-{k:02d}.{"jpg" if facts.pop("photo") else "png"}'
+        rename[name] = new
+        images[new] = {**facts, 'box': [page + offset, *[round(v, 2) for v in bbox]]}
+
+    def name_ref(m):
+        new = rename.get(m.group(2))
+        return f'![{m.group(1)}](images/{new})' if new else ''
+    texts = [re.sub(r'!\[([^\]]*)\]\(images/([^)\s]+)\)', name_ref, relative_image_refs(c.get('text', ''), img_dir))
+             for c in chunks]
+    return {'first': first, 'pages': texts, 'images': images}
+
+
+PART_IMAGE_NAME = re.compile(r'^(pic|missed)-\d{4,5}-\d{2}\.(png|jpg)$')
+MAX_PAGE_CHARS = 200_000
+
+
+def _number(v, lo, hi):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and lo <= v <= hi
+
+
+def join_parts(parts, page_count):
+    """
+    The parts read by read_part, checked and put in page order: (page texts, picture facts). They
+    come back through the browser, so every value is checked; a part that does not fit is refused.
+    """
+    bad = PdfConversionError('The parts of this PDF did not fit together. Please convert it again.')
+    if not isinstance(parts, list) or not parts:
+        raise bad
+    texts, facts = [], {}
+    for part in sorted((p for p in parts if isinstance(p, dict)), key=lambda p: p.get('first', -1)):
+        pages = part.get('pages')
+        if part.get('first') != len(texts) or not isinstance(pages, list) or \
+                not all(isinstance(t, str) for t in pages):
+            raise bad
+        texts += [t[:MAX_PAGE_CHARS] for t in pages]
+        for name, f in (part.get('images') or {}).items() if isinstance(part.get('images'), dict) else ():
+            if not (isinstance(name, str) and PART_IMAGE_NAME.match(name) and isinstance(f, dict)):
+                continue
+            box, size = f.get('box'), f.get('size')
+            if not (isinstance(box, list) and len(box) == 5 and isinstance(box[0], int) and 0 <= box[0] < page_count
+                    and all(_number(v, -1e5, 1e5) for v in box[1:])
+                    and isinstance(size, list) and len(size) == 2 and all(isinstance(v, int) and 0 < v <= 20000 for v in size)
+                    and (f.get('hash') is None or isinstance(f.get('hash'), int) and 0 <= f['hash'] < 1 << 64)
+                    and isinstance(f.get('side'), int) and _number(f.get('aspect'), 0, 1e6)
+                    and isinstance(f.get('usable'), bool)):
+                continue
+            facts[name] = {k: f[k] for k in ('box', 'size', 'hash', 'side', 'aspect', 'usable')}
+    if len(texts) != page_count:
+        raise bad
+    return texts, facts
+
+
+SIZES_FILE = 'image_sizes.json'
+
+
+def image_facts(path):
+    """What filtering and planning need to know about a picture, so the picture need not be kept."""
+    try:
+        with Image.open(path) as im:
+            im.load()
+            img = im.copy()
+    except (OSError, ValueError):
+        return None
+    w, h = img.size
+    if max(w, h) > MAX_IMAGE_PX:  # as shrink_image does
+        img.thumbnail((MAX_IMAGE_PX, MAX_IMAGE_PX), Image.LANCZOS)
+    size = list(img.size)
+    return {'hash': image_hash(path), 'side': max(w, h), 'aspect': round(max(w, h) / max(1, min(w, h)), 3),
+            'usable': usable_image(path), 'photo': _is_photo(img), 'size': size}
 
 
 BOXES_FILE = 'image_boxes.json'
@@ -293,24 +522,30 @@ def relative_image_refs(markdown, img_dir):
     return re.sub(r'!\[([^\]]*)\]\(([^)\s]+)\)', repl, markdown)
 
 
-def filter_images(markdown, base_dir):
+def filter_images(markdown, base_dir, facts=None):
     """
     Drop image references that are icons, rules or blank boxes, and repeats of the same
     picture (matched by perceptual hash, so resized copies count). The first copy of a
     picture is kept, unless it is a small graphic repeated on many pages (a logo in the
-    page header), in which case every copy goes.
+    page header), in which case every copy goes. facts: {file name: image_facts} for pictures
+    known without their files (a book read in parts); a reference with no facts is dropped.
     """
     lines = markdown.split('\n')
-    refs = []  # (line index, path, hash, longest side)
+    refs = []  # (line index, hash, longest side, aspect, usable)
     for n, line in enumerate(lines):
         m = IMAGE_RE.match(line.strip())
-        if m:
+        if not m:
+            continue
+        if facts is not None:
+            f = facts.get(Path(m.group('path')).name)
+            refs.append((n, f['hash'], f['side'], f['aspect'], f['usable']) if f else (n, None, 0, 1.0, False))
+        else:
             path = resolve(base_dir, m.group('path'))
-            refs.append((n, path, image_hash(path), image_side(path)))
+            refs.append((n, image_hash(path), image_side(path), image_aspect(path), usable_image(path)))
 
     clusters = []  # [representative hash, count]
     cluster_of = {}
-    for n, _, h, _ in refs:
+    for n, h, *_ in refs:
         if h is None:
             continue
         for k, (rep, _) in enumerate(clusters):
@@ -323,12 +558,12 @@ def filter_images(markdown, base_dir):
             clusters.append([h, 1])
 
     seen, drop = set(), set()
-    for n, path, h, side in refs:
+    for n, h, side, aspect, usable in refs:
         k = cluster_of.get(n)
         # Repeated on 3+ pages and small or banner-shaped: a logo or a running header drawn as art
         repeated_logo = k is not None and clusters[k][1] >= REPEAT_LIMIT \
-            and (side < LOGO_MAX_PX or image_aspect(path) >= BANNER_ASPECT)
-        if k is None or k in seen or repeated_logo or not usable_image(path):
+            and (side < LOGO_MAX_PX or aspect >= BANNER_ASPECT)
+        if k is None or k in seen or repeated_logo or not usable:
             drop.add(n)
         if k is not None:
             seen.add(k)
@@ -394,10 +629,7 @@ def shrink_image(path, max_px, quality):
     if max(img.size) > max_px:
         img = img.copy()
         img.thumbnail((max_px, max_px), Image.LANCZOS)
-    has_alpha = img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info)
-    # Photos have thousands of distinct colours; charts and diagrams have few and compress better as PNG
-    photo = not has_alpha and len(img.convert('RGB').resize((96, 96)).getcolors(96 * 96)) > 2000
-    if photo:
+    if _is_photo(img):
         new = path.with_suffix('.jpg')
         img.convert('RGB').save(new, 'JPEG', quality=quality, optimize=True)
         if new != path:
@@ -405,6 +637,12 @@ def shrink_image(path, max_px, quality):
         return new
     img.save(path, optimize=True)
     return path
+
+
+def _is_photo(img):
+    """Photos have thousands of distinct colours; charts and diagrams have few and compress better as PNG."""
+    has_alpha = img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info)
+    return not has_alpha and len(img.convert('RGB').resize((96, 96)).getcolors(96 * 96)) > 2000
 
 
 def resolve(base_dir, ref):

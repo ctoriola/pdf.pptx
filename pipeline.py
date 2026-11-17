@@ -10,6 +10,7 @@ import re
 from pathlib import Path
 
 import condense
+import deck_builder
 import planner
 import semantics
 import text_repair
@@ -20,6 +21,22 @@ from slide_plan import get_plan
 log = logging.getLogger(__name__)
 
 SUBTITLES = {'condensed': 'Summary', 'standard': 'Presentation', 'detailed': 'In-depth presentation'}
+
+
+def _exists(path):
+    """A picture on disk, or one known by size only (a book read in parts, while it is planned)."""
+    return path.is_file() or str(path) in deck_builder.KNOWN_SIZES
+
+
+def _picture_sizes(md_dir):
+    """{absolute path: (w, h)} for the pictures of a book read in parts (see pdf_to_md.SIZES_FILE)."""
+    from pdf_to_md import SIZES_FILE
+    base = Path(md_dir).resolve()
+    try:
+        sizes = json.loads((base / SIZES_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return {str((base / 'images' / name).resolve()): tuple(size) for name, size in sizes.items()}
 
 
 def load_sections(md_path):
@@ -33,7 +50,7 @@ def load_sections(md_path):
                 p = Path(b['path'])
                 p = p if p.is_absolute() else (base / p).resolve()
                 # Never read files outside the job folder, whatever the Markdown says
-                b['path'] = str(p) if base in p.parents and p.is_file() else ''
+                b['path'] = str(p) if base in p.parents and _exists(p) else ''
         blocks[:] = [b for b in blocks if b['type'] != 'image' or b['path']]
     return title, move_trailing_subheadings(merge_empty_sections(sections))
 
@@ -88,7 +105,7 @@ def deck_title(md_title, pdf_path, override=None):
 
 PLAN_VERSION = 1
 BLOCK_TYPES = {'para', 'quote', 'sub', 'list', 'table', 'image', 'price', 'steps', 'meta', 'chapter'}
-MAX_PLAN_SECTIONS = 3000
+MAX_PLAN_SECTIONS = 20000
 # Condensed and Detailed send the chosen text to the LLM, whose free tier is rate-limited per minute
 MAX_AI_WORDS = int(os.environ.get('MAX_AI_WORDS', 30000))
 
@@ -183,7 +200,7 @@ def sections_from_plan(plan, md_dir, selected=None):
                 continue
             if b['type'] == 'image':
                 p = (base / str(b.get('path') or '')).resolve()
-                if base not in p.parents or not p.is_file():
+                if base not in p.parents or not _exists(p):
                     continue  # never read outside this conversion's own files
                 b = {**b, 'path': str(p)}
             blocks.append(b)
@@ -294,12 +311,12 @@ def build_from_markdown(md_path, mode='standard', theme='coral', title=None, pdf
     return build_from_plan(plan, Path(md_path).parent, mode, theme, None, progress)
 
 
-def read_pdf(pdf_path, work_dir, mode='standard', progress=None, ocr_lines=None):
+def read_pdf(pdf_path, work_dir, mode='standard', progress=None, ocr_lines=None, parts=None):
     """PDF -> Markdown and images in work_dir/markdown. Returns the Markdown path."""
     from pdf_to_md import convert_pdf
     progress = progress or (lambda msg: None)
     progress('Reading the PDF (layout, text, tables and images)…')
-    return convert_pdf(pdf_path, Path(work_dir) / 'markdown', progress, ocr_lines)
+    return convert_pdf(pdf_path, Path(work_dir) / 'markdown', progress, ocr_lines, parts)
 
 
 IMAGE_SUFFIXES = {'.png', '.jpg', '.jpeg'}
@@ -332,11 +349,13 @@ def _image_jobs(plan, md_dir, selected):
     return list(jobs.values())
 
 
-def plan_pdf(pdf_path, work_dir, mode='standard', title=None, progress=None, source_name=None, ocr_lines=None):
+def plan_pdf(pdf_path, work_dir, mode='standard', title=None, progress=None, source_name=None, ocr_lines=None,
+             parts=None):
     """Step 1 of 2: read the PDF and plan its sections. Returns (plan, outline rows, md_path)."""
-    md_path = read_pdf(pdf_path, work_dir, mode, progress, ocr_lines)
-    plan = plan_from_markdown(md_path, mode, title, source_name or pdf_path, progress)
-    return plan, outline(plan, md_path.parent), md_path
+    md_path = read_pdf(pdf_path, work_dir, mode, progress, ocr_lines, parts)
+    with deck_builder.known_sizes(_picture_sizes(md_path.parent)):
+        plan = plan_from_markdown(md_path, mode, title, source_name or pdf_path, progress)
+        return plan, outline(plan, md_path.parent), md_path
 
 
 def build_pdf(pdf_path, work_dir, plan, mode='standard', theme='coral', selected=None, progress=None):

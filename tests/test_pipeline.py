@@ -924,7 +924,7 @@ def test_repeated_banner_graphics_are_dropped(tmp_path):
 def test_page_limits(tmp_path, monkeypatch):
     """Textbook-length PDFs are read in every slide type; the page cap still applies."""
     import pymupdf
-    assert pdf_to_md.MAX_PAGES >= 800
+    assert pdf_to_md.MAX_PAGES >= 3000
     doc = pymupdf.open()
     for n in range(6):
         doc.new_page().insert_textbox((60, 60, 520, 700), f'Page {n} body text about first aid and care. ' * 20, fontsize=10)
@@ -1689,3 +1689,115 @@ def test_ocr_results_from_the_browser_are_checked(tmp_path):
     assert out[0][0] == [10, 50, 12, 'Hello world']
     x0, base, size, _ = out[0][1]
     assert x0 == 0 and base == doc[0].rect.height and size == 200
+
+
+# ---------- long books: read in parts by parallel requests ----------
+def _plan_shape(plan):
+    return re.sub(r'images/[^"]+', 'IMG', json.dumps(plan['sections']))
+
+
+@pytest.mark.parametrize('pdf', [HANDBOOK, BROCHURE_PDF, SAMPLE_PDF])
+def test_reading_in_parts_gives_the_same_plan(pdf, tmp_path, monkeypatch):
+    from pipeline import plan_pdf
+    whole, rows, _ = plan_pdf(pdf, tmp_path / 'whole')
+    monkeypatch.setattr(pdf_to_md, 'READ_PAGES', 2)
+    with pytest.raises(pdf_to_md.NeedsParts) as exc:
+        plan_pdf(pdf, tmp_path / 'x')
+    parts = [pdf_to_md.read_part(pdf, first, count, tmp_path / f'p{first}') for first, count in exc.value.ranges]
+    parts = json.loads(json.dumps(parts))  # as it travels through the browser
+    joined, rows2, md = plan_pdf(pdf, tmp_path / 'joined', parts=parts)
+    assert _plan_shape(joined) == _plan_shape(whole)  # heading levels ranked over the whole book
+    assert [(r['name'], r['slides'], r['images']) for r in rows2] == [(r['name'], r['slides'], r['images']) for r in rows]
+    assert not list((md.parent / 'images').iterdir())  # planned from sizes: no picture kept
+
+
+def test_long_book_builds_from_parts(tmp_path, monkeypatch):
+    from pipeline import build_pdf, plan_pdf
+    monkeypatch.setattr(pdf_to_md, 'READ_PAGES', 2)
+    with pytest.raises(pdf_to_md.NeedsParts) as exc:
+        plan_pdf(BROCHURE_PDF, tmp_path / 'x')
+    parts = [pdf_to_md.read_part(BROCHURE_PDF, f, c, tmp_path / f'p{f}') for f, c in exc.value.ranges]
+    plan, rows, _ = plan_pdf(BROCHURE_PDF, tmp_path / 'plan', parts=json.loads(json.dumps(parts)))
+    pptx, _, _, slides = build_pdf(BROCHURE_PDF, tmp_path / 'build', plan, 'standard')
+    pics = [sh for s in Presentation(str(pptx)).slides for sh in s.shapes if sh.shape_type == 13]
+    assert len(pics) == sum(r['images'] for r in rows) > 0
+
+
+def test_parts_that_do_not_fit_are_refused():
+    part = {'first': 0, 'pages': ['a', 'b'], 'images': {
+        'pic-0001-00.png': {'box': [0, 1, 2, 3, 4], 'size': [10, 10], 'hash': 5, 'side': 10, 'aspect': 1.0,
+                            'usable': True},
+        'pic-0001-01.png': {'box': [99, 1, 2, 3, 4], 'size': [10, 10], 'hash': 5, 'side': 10, 'aspect': 1.0,
+                            'usable': True},                                    # page outside the book
+        '../evil.png': {'box': [0, 1, 2, 3, 4], 'size': [10, 10], 'hash': 5, 'side': 10, 'aspect': 1.0,
+                        'usable': True}}}
+    texts, facts = pdf_to_md.join_parts([part], 2)
+    assert texts == ['a', 'b'] and list(facts) == ['pic-0001-00.png']
+    for bad in ([part], [{**part, 'first': 1}], 'nope', []):
+        with pytest.raises(pdf_to_md.PdfConversionError, match='did not fit together'):
+            pdf_to_md.join_parts(bad, 3)
+
+
+def test_long_book_routes_direct_upload(client, monkeypatch):
+    import gzip
+    import io
+    monkeypatch.setattr(pdf_to_md, 'READ_PAGES', 3)
+    with open(HANDBOOK, 'rb') as f:
+        res = client.post('/plan', data={'pdf': (f, 'handbook.pdf'), 'mode': 'standard'})
+    data = _unzip(res)
+    assert data['needs_parts'] and data['pages'] == 7
+    assert [(p['first'], p['count']) for p in data['parts']] == [(0, 3), (3, 3), (6, 1)]
+    parts = []
+    for p in data['parts']:
+        with open(HANDBOOK, 'rb') as f:
+            res = client.post('/read', data={'pdf': (f, 'handbook.pdf'), 'first': p['first'], 'count': p['count']})
+        assert res.status_code == 200, res.data[:200]
+        parts.append(_unzip(res))
+    with open(HANDBOOK, 'rb') as f:
+        res = client.post('/read', data={'pdf': (f, 'handbook.pdf'), 'first': 0, 'count': 4})
+    assert res.status_code == 400  # more than one request reads
+    with open(HANDBOOK, 'rb') as f:
+        res = client.post('/plan', data={'pdf': (f, 'handbook.pdf'), 'mode': 'standard',
+                                         'parts': (io.BytesIO(gzip.compress(json.dumps(parts).encode())), 'p.json.gz')})
+    data = _unzip(res)
+    assert res.status_code == 200 and 'General Concepts of First Aid' in [r['name'] for r in data['sections']]
+
+
+def test_long_book_parts_go_through_cloud_storage(cloud, monkeypatch):
+    client, fake = cloud
+    monkeypatch.setattr(pdf_to_md, 'READ_PAGES', 4)
+    upload = 'uploads/' + 'ab' * 16 + '.pdf'
+    fake.uploads[upload] = HANDBOOK
+    data = _unzip(client.post('/plan', data={'storage_path': upload, 'filename': 'h.pdf', 'mode': 'standard'}))
+    assert [p['source'] for p in data['parts']] == ['outputs/' + 'ab' * 16 + '/part-0.pdf',
+                                                    'outputs/' + 'ab' * 16 + '/part-1.pdf']
+    parts = []
+    for p in data['parts']:
+        res = client.post('/read', data={'storage_path': upload, 'part': p['source'], 'first': p['first'],
+                                         'count': p['count']})
+        assert res.status_code == 200, res.data[:200]
+        parts.append(_unzip(res))
+        assert p['source'] in fake.deleted
+    assert any(img['box'][0] >= 4 for p in parts for img in p['images'].values()) or \
+        all(not p['images'] for p in parts[1:])  # pictures keep their page in the whole book
+    for bad in ('outputs/' + 'ab' * 16 + '/ocr-0.pdf', 'outputs/' + 'cc' * 16 + '/part-0.pdf'):
+        res = client.post('/read', data={'storage_path': upload, 'part': bad, 'first': 0, 'count': 4})
+        assert res.status_code == 400
+
+
+def test_scanned_long_book_is_ocred_before_it_is_read_in_parts(tmp_path, monkeypatch):
+    from pipeline import plan_pdf
+    scan = scanned_copy(HANDBOOK, tmp_path / 'scan.pdf')
+    monkeypatch.setattr(pdf_to_md, 'READ_PAGES', 4)
+    with pytest.raises(pdf_to_md.NeedsOcr) as exc:  # even a few scanned pages: the parts need their text
+        plan_pdf(scan, tmp_path / 'a')
+    import pymupdf
+    lines = {str(k): v for k, v in ocr.read_pages(pymupdf.open(scan), exc.value.pages).items()}
+    lines = json.loads(json.dumps(lines))
+    with pytest.raises(pdf_to_md.NeedsParts) as exc:
+        plan_pdf(scan, tmp_path / 'b', ocr_lines=lines)
+    parts = [pdf_to_md.read_part(scan, f, c, tmp_path / f'p{f}',
+                                 {k: v for k, v in lines.items() if f <= int(k) < f + c}) for f, c in exc.value.ranges]
+    plan, rows, _ = plan_pdf(scan, tmp_path / 'c', ocr_lines=lines, parts=json.loads(json.dumps(parts)))
+    names = [r['name'] for r in rows]
+    assert 'General Concepts of First Aid' in names and plan['meta']['ocr_pages'] == 7

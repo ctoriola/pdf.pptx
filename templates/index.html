@@ -249,35 +249,64 @@
     return await new Response(blob.stream().pipeThrough(new CompressionStream('gzip'))).blob();
   }
 
-  // Scanned pages, more than one request can read: OCR batches, OCR_AT_ONCE requests at a time (each its own Vercel function)
-  const OCR_AT_ONCE = 4;
+  // Work too long for one request, spread over several running at once (each its own Vercel function):
+  // makeBody(item) gives one request's body; onDone(item, json) takes its answer
+  const AT_ONCE = 4;
+  async function inParallel(url, items, makeBody, onDone) {
+    const queue = items.slice();
+    async function worker() {
+      while (queue.length) {
+        const item = queue.shift();
+        let res = null;
+        for (let attempt = 0; attempt < 2 && !(res && res.ok); attempt++) {
+          try { res = await fetch(url, { method: 'POST', body: await makeBody(item) }); } catch (e) { res = null; }
+        }
+        if (!res || !res.ok) {
+          const err = new Error(url);
+          err.userMessage = res ? await errorText(res) : 'Could not reach the server.';
+          throw err;
+        }
+        onDone(item, await res.json());
+      }
+    }
+    await Promise.all(Array.from({ length: AT_ONCE }, worker));
+  }
+
+  // Scanned pages, more than one request can read: OCR in batches
   async function readScannedPages(data) {
-    const queue = data.batches.slice(), lines = {};
+    const lines = {};
     let done = 0;
     const note = () => show('running', `Reading scanned pages (OCR)… ${done} of ${data.pages}`,
                             'A scanned book takes a few minutes. Keep this tab open.');
     note();
-    async function worker() {
-      while (queue.length) {
-        const batch = queue.shift();
-        const extra = { pages: batch.pages.join(',') };
-        if (batch.source) extra.batch = batch.source;
-        let res = null;
-        for (let attempt = 0; attempt < 2 && !(res && res.ok); attempt++) {
-          try { res = await fetch('/ocr', { method: 'POST', body: requestBody(extra) }); } catch (e) { res = null; }
-        }
-        if (!res || !res.ok) {
-          const err = new Error('ocr');
-          err.userMessage = res ? await errorText(res) : 'Could not reach the server.';
-          throw err;
-        }
-        Object.assign(lines, (await res.json()).lines);
-        done += batch.pages.length;
-        note();
-      }
-    }
-    await Promise.all(Array.from({ length: OCR_AT_ONCE }, worker));
+    await inParallel('/ocr', data.batches, batch => {
+      const extra = { pages: batch.pages.join(',') };
+      if (batch.source) extra.batch = batch.source;
+      return requestBody(extra);
+    }, (batch, json) => { Object.assign(lines, json.lines); done += batch.pages.length; note(); });
     return lines;
+  }
+
+  // A long book, read in parts; each part gets the OCR text of its own scanned pages
+  async function readParts(data, lines) {
+    const parts = [];
+    let done = 0;
+    const note = () => show('running', `Reading the book… ${done} of ${data.pages} pages`,
+                            'A long book takes a few minutes. Keep this tab open.');
+    note();
+    await inParallel('/read', data.parts, async part => {
+      const extra = { first: part.first, count: part.count };
+      if (part.source) extra.part = part.source;
+      if (lines) {
+        const mine = {};
+        for (const [page, value] of Object.entries(lines)) {
+          if (page >= part.first && page < part.first + part.count) mine[page] = value;
+        }
+        extra.ocr = await compressed(mine);
+      }
+      return requestBody(extra);
+    }, (part, json) => { parts.push(json); done += part.count; note(); });
+    return parts;
   }
 
   // ---------------- step 1: read the PDF and plan its sections ----------------
@@ -296,18 +325,26 @@
       }
       startTicker(['Reading the PDF (layout, text, tables and images)…', 'Working out its chapters and sections…',
                    'Planning the slide structure…'], 4000);
-      let res = await fetch('/plan', { method: 'POST', body: requestBody() });
-      if (!res.ok) return show('error', await errorText(res));
-      let data = await res.json();
-      if (data.needs_ocr) {  // a scanned book: its pages are read in batches, then the PDF again
-        clearInterval(ticker); ticker = null;
-        const lines = await readScannedPages(data);
-        startTicker(['Reading the PDF with the text from its scanned pages…', 'Working out its chapters and sections…',
-                     'Planning the slide structure…'], 6000);
-        res = await fetch('/plan', { method: 'POST', body: requestBody({ ocr: await compressed(lines) }) });
+      // A scanned book has its scanned pages read first (OCR, in batches); a long book is read in
+      // parts by several requests at once; then the plan is made from what they read
+      const extra = {};
+      let lines = null, data = null;
+      for (let round = 0; round < 3; round++) {
+        const res = await fetch('/plan', { method: 'POST', body: requestBody(extra) });
         if (!res.ok) return show('error', await errorText(res));
         data = await res.json();
+        if (data.needs_ocr) {
+          clearInterval(ticker); ticker = null;
+          lines = await readScannedPages(data);
+          extra.ocr = await compressed(lines);
+        } else if (data.needs_parts) {
+          clearInterval(ticker); ticker = null;
+          extra.parts = await compressed(await readParts(data, lines));
+        } else break;
+        startTicker(['Putting the pages together…', 'Working out its chapters and sections…',
+                     'Planning the slide structure…', 'Still planning. Long books take a minute or two…'], 8000);
       }
+      if (!data || data.needs_ocr || data.needs_parts) return show('error', 'This PDF could not be read.');
       job.plan = data.plan; job.rows = data.sections; job.markdownUrl = data.markdown_url || null;
       clearInterval(ticker); ticker = null;
       progress.hidden = true;

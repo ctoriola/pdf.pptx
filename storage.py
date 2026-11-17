@@ -155,11 +155,11 @@ def download(path, dest):
                 f.write(chunk)
 
 
-OCR_BATCH_RE = re.compile(r'^outputs/(?P<id>[0-9a-f]{32})/ocr-\d{1,4}\.pdf$')
+WORK_FILE_RE = re.compile(r'^outputs/(?P<id>[0-9a-f]{32})/(?P<kind>ocr|part)-\d{1,4}\.pdf$')
 
 
 def put(local_path, path, content_type='application/pdf'):
-    """Upload a working file (an OCR batch) under outputs/, which the lifecycle rule clears."""
+    """Upload a working file (an OCR batch, a part of a long book) under outputs/, cleared by the lifecycle rule."""
     headers = {'Content-Type': content_type}
     with open(local_path, 'rb') as f:
         resp = requests.put(presign('PUT', path, 300, headers), data=f, headers=headers, timeout=120)
@@ -167,10 +167,10 @@ def put(local_path, path, content_type='application/pdf'):
         raise RuntimeError(f'B2 upload failed ({resp.status_code}): {resp.text[:300]}')
 
 
-def check_ocr_batch_path(path, upload_id):
-    """Only accept outputs/<this upload's id>/ocr-<n>.pdf."""
-    m = OCR_BATCH_RE.match(path or '')
-    if not m or m.group('id') != upload_id:
+def check_work_file(path, upload_id, kind):
+    """Only accept outputs/<this upload's id>/<kind>-<n>.pdf (kind: ocr or part)."""
+    m = WORK_FILE_RE.match(path or '')
+    if not m or m.group('id') != upload_id or m.group('kind') != kind:
         raise StorageError('That page batch reference is not valid.')
     return path
 

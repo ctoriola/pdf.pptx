@@ -10,6 +10,7 @@ import math
 import re
 import threading
 import zipfile
+from contextlib import contextmanager
 from datetime import date
 from io import BytesIO
 
@@ -454,12 +455,32 @@ def number_badge(slide, x, y, d, label, fill=None, color=None, size=None):
     return circle
 
 
+# Picture sizes known without the picture: a long book is planned from its pages' text and each
+# picture's size (read in parts, elsewhere), and only the chosen pictures are cut when building.
+KNOWN_SIZES = {}
+_drawing_pictures = True   # off while estimating slide counts: no picture needs to exist
+
+
 def image_size(path):
+    known = KNOWN_SIZES.get(str(path))
+    if known:
+        return tuple(known)
     try:
         with Image.open(path) as im:
             return im.size
     except (OSError, ValueError):
         return None
+
+
+@contextmanager
+def known_sizes(sizes):
+    """Register {absolute path: (w, h)} for the duration of a planning step."""
+    KNOWN_SIZES.update(sizes)
+    try:
+        yield
+    finally:
+        for key in sizes:
+            KNOWN_SIZES.pop(key, None)
 
 
 def place_image(slide, path, x, y, w, h, caption=''):
@@ -473,7 +494,8 @@ def place_image(slide, path, x, y, w, h, caption=''):
     dw, dh = iw * scale, ih * scale
     dx = x + (w - dw) / 2
     dy = y + (img_h_avail - dh) / 2
-    slide.shapes.add_picture(str(path), Inches(dx), Inches(dy), Inches(dw), Inches(dh))
+    if _drawing_pictures:
+        slide.shapes.add_picture(str(path), Inches(dx), Inches(dy), Inches(dw), Inches(dh))
     if caption:
         text = caption if len(caption) <= 160 else caption[:157].rstrip() + '…'
         add_text(slide, x, dy + dh + 0.1, w, CAPTION_H - 0.1, text, 11, T.muted, italic=True,
@@ -1354,17 +1376,21 @@ def estimate_slides(sections, one_slide_per_section=False):
     Slides each section would make on its own (split at its sub-headings, as in a real build;
     packing with neighbours and chapter dividers not counted). Used by the section picker.
     """
-    global T
+    global T, _drawing_pictures
     with _theme_lock:
         T = THEMES[DEFAULT_THEME]
         builder = DeckBuilder('estimate', one_slide_per_section=one_slide_per_section)
         counts = []
-        for name, blocks in sections:
-            before = builder.page
-            parts = [(name, blocks)] if one_slide_per_section else split_long_sections([(name, blocks)])
-            for part_name, part in parts:
-                builder.section(1, part_name, part)
-            counts.append(builder.page - before)
+        _drawing_pictures = False  # the layout only needs each picture's size
+        try:
+            for name, blocks in sections:
+                before = builder.page
+                parts = [(name, blocks)] if one_slide_per_section else split_long_sections([(name, blocks)])
+                for part_name, part in parts:
+                    builder.section(1, part_name, part)
+                counts.append(builder.page - before)
+        finally:
+            _drawing_pictures = True
         return counts
 
 
